@@ -1,0 +1,467 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Panel Controls</title>
+
+<!-- Launches full-screen from the home screen on iOS, like an installed app. -->
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Panel">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#F6E9CC">
+<meta name="robots" content="noindex,nofollow">
+
+<link rel="manifest" href="manifest.json">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<link rel="icon" type="image/png" sizes="192x192" href="icon-192.png">
+
+<!--
+  ONE page serves every panel ever shipped.
+
+  The per-unit part arrives in the URL fragment (#t=<topic>), which the panel
+  writes into its QR at runtime. Browsers never transmit a fragment to the
+  server, so this host never learns which topic belongs to which customer --
+  no logs to leak, nothing to store, no backend at all.
+
+  Colours are the panel's own Rustic Radiance palette at their TRUE values.
+  The firmware uses counter-tinted variants (burgundy 0x8E1E12 instead of
+  0x7E102C) purely to fight the TFT's magenta shift -- a phone screen renders
+  correctly, so the page uses the real palette and the two still read as one
+  product side by side.
+
+  INSTALLED-APP BEHAVIOUR: a manifest cannot carry a per-panel start_url, so
+  an Android launch from the home screen opens "./" with NO fragment. The
+  topic is therefore remembered in localStorage the first time the QR link is
+  opened, and read back when the fragment is absent. iOS keeps the fragment
+  in the saved bookmark, so both routes work -- belt and braces.
+-->
+
+<style>
+  :root {
+    --bg:        #F6E9CC;   /* panel settings cream  */
+    --card:      #FFFDF6;   /* panel card fill       */
+    --line:      #E3D8B8;   /* panel hairline border */
+    --shadow:    rgba(201,187,142,.55);
+    --wine:      #7E102C;   /* Rustic Radiance burgundy */
+    --wine-dark: #650B22;
+    --rose:      #D7A9A8;   /* Rustic Radiance dusty rose */
+    --ink:       #3D3830;
+    --ink-soft:  #7A7366;
+    --gold-text: #5F4712;
+  }
+
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+
+  html, body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+                 "Helvetica Neue", Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  body {
+    min-height: 100svh;
+    padding: max(28px, env(safe-area-inset-top)) 20px
+             max(28px, env(safe-area-inset-bottom));
+    display: flex;
+    justify-content: center;
+  }
+
+  .wrap { width: 100%; max-width: 440px; }
+
+  /* ---- Header ---- */
+  header { text-align: center; margin-bottom: 26px; }
+
+  h1 {
+    margin: 0;
+    font-size: 15px;
+    font-weight: 600;
+    letter-spacing: .22em;
+    text-transform: uppercase;
+    color: var(--gold-text);
+  }
+
+  .topic-badge {
+    margin-top: 8px;
+    font-size: 12.5px;
+    letter-spacing: .02em;
+    color: var(--ink-soft);
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* ---- Buttons ---- */
+  button {
+    width: 100%;
+    font-family: inherit;
+    border-radius: 16px;
+    cursor: pointer;
+    transition: transform .12s ease, box-shadow .12s ease, background-color .18s ease;
+  }
+  button:active { transform: translateY(1px) scale(.995); }
+  button:disabled { opacity: .55; cursor: default; }
+
+  .primary {
+    padding: 30px 20px;
+    font-size: 21px;
+    font-weight: 600;
+    letter-spacing: .04em;
+    color: #FBEFE2;
+    background: var(--wine);
+    border: none;
+    box-shadow: 0 6px 18px rgba(126,16,44,.26);
+  }
+  .primary:active { background: var(--wine-dark); }
+  .primary.confirm { background: var(--wine-dark); }
+
+  .grid {
+    margin-top: 14px;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+  }
+
+  .secondary {
+    padding: 17px 10px;
+    font-size: 14.5px;
+    font-weight: 500;
+    letter-spacing: .015em;
+    color: var(--gold-text);
+    background: var(--card);
+    border: 1px solid var(--line);
+    box-shadow: 0 2px 8px var(--shadow);
+  }
+  .secondary.wide { grid-column: 1 / -1; }
+  .secondary.confirm {
+    background: #F6E2AE;
+    border-color: #A8842E;
+    color: #5F4712;
+  }
+
+  /* ---- Status line ---- */
+  .status {
+    margin-top: 16px;
+    min-height: 20px;
+    text-align: center;
+    font-size: 13.5px;
+    color: var(--ink-soft);
+    opacity: 0;
+    transition: opacity .25s ease;
+  }
+  .status.show { opacity: 1; }
+  .status.err  { color: #A3302B; }
+
+  /* ---- Notifications card ---- */
+  .rule {
+    margin: 30px 0 24px;
+    height: 1px;
+    background: linear-gradient(to right, transparent, var(--line), transparent);
+  }
+
+  .card {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 18px;
+    padding: 20px;
+    box-shadow: 0 2px 8px var(--shadow);
+  }
+
+  .card h2 {
+    margin: 0 0 6px;
+    font-size: 14px;
+    font-weight: 600;
+    letter-spacing: .13em;
+    text-transform: uppercase;
+    color: var(--gold-text);
+  }
+
+  .card p {
+    margin: 0 0 16px;
+    font-size: 13.5px;
+    line-height: 1.55;
+    color: var(--ink-soft);
+  }
+
+  .topic-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    background: var(--bg);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 12px 14px;
+  }
+
+  .topic-row code {
+    flex: 1;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 13.5px;
+    color: var(--wine);
+    word-break: break-all;
+    line-height: 1.4;
+  }
+
+  .copy {
+    flex: 0 0 auto;
+    width: auto;
+    padding: 8px 14px;
+    font-size: 12.5px;
+    font-weight: 600;
+    letter-spacing: .04em;
+    border-radius: 9px;
+    color: var(--gold-text);
+    background: #F6E2AE;
+    border: 1px solid #C9A85C;
+  }
+
+  .stores {
+    margin-top: 14px;
+    display: flex;
+    gap: 10px;
+  }
+
+  .stores a {
+    flex: 1;
+    text-align: center;
+    padding: 12px 8px;
+    font-size: 13px;
+    font-weight: 500;
+    text-decoration: none;
+    color: var(--gold-text);
+    background: var(--bg);
+    border: 1px solid var(--line);
+    border-radius: 11px;
+  }
+
+  footer {
+    margin-top: 22px;
+    text-align: center;
+    font-size: 11.5px;
+    line-height: 1.6;
+    color: #9A9387;
+  }
+
+  /* Shown instead of everything when the link carries no topic. */
+  .nolink {
+    text-align: center;
+    padding: 46px 24px;
+    color: var(--ink-soft);
+    font-size: 14.5px;
+    line-height: 1.6;
+  }
+  .nolink strong { color: var(--ink); display: block; margin-bottom: 8px; font-size: 16px; }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg:       #16120F;
+      --card:     #211B16;
+      --line:     #3A2F25;
+      --shadow:   rgba(0,0,0,.4);
+      --ink:      #EDE3D2;
+      --ink-soft: #A29684;
+      --wine:     #96203C;
+      --wine-dark:#7E102C;
+      --gold-text:#E1C78E;
+    }
+    .secondary.confirm { background: #4A3A1A; border-color: #C9A85C; color: #F3DFB0; }
+    .copy { background: #4A3A1A; border-color: #C9A85C; color: #F3DFB0; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap" id="wrap">
+
+  <header>
+    <h1>Front Door Panel</h1>
+    <div class="topic-badge" id="badge"></div>
+  </header>
+
+  <button class="primary" id="btn-off">All Lights Off</button>
+
+  <div class="grid">
+    <button class="secondary" id="btn-status">Check Status</button>
+    <button class="secondary" id="btn-restart" data-confirm="1">Restart Panel</button>
+    <button class="secondary wide" id="btn-update" data-confirm="1">Allow Update &middot; 5 min</button>
+  </div>
+
+  <div class="status" id="status"></div>
+
+  <div class="rule"></div>
+
+  <div class="card">
+    <h2>Notifications</h2>
+    <p>Install the free <strong>ntfy</strong> app and subscribe to the topic
+       below to get an alert when the doorbell rings &mdash; and a confirmation
+       whenever you use a button above.</p>
+
+    <div class="topic-row">
+      <code id="topic-text"></code>
+      <button class="copy" id="btn-copy">Copy</button>
+    </div>
+
+    <div class="stores">
+      <a href="https://apps.apple.com/app/ntfy/id1625396347" target="_blank" rel="noopener">iPhone</a>
+      <a href="https://play.google.com/store/apps/details?id=io.heckel.ntfy" target="_blank" rel="noopener">Android</a>
+    </div>
+  </div>
+
+  <footer>
+    Add this page to your home screen for one-tap access.<br>
+    Commands reach the panel from anywhere.
+  </footer>
+
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  // ---- Topic comes from the URL fragment the panel's QR encodes ----------
+  // Accepts "#t=topic" and a bare "#topic" so a hand-typed link still works.
+  function readTopic() {
+    var h = (location.hash || "").replace(/^#/, "");
+    if (!h) return "";
+    var m = /(?:^|&)t=([^&]+)/.exec(h);
+    var raw = m ? m[1] : h;
+    try { raw = decodeURIComponent(raw); } catch (e) { /* use as-is */ }
+    // Only ntfy-legal characters; silently drop anything else so a mangled
+    // link can never be turned into a request somewhere unintended.
+    return (raw.match(/[A-Za-z0-9_-]+/g) || []).join("").slice(0, 64);
+  }
+
+  // A home-screen launch on Android opens the manifest's start_url, which
+  // cannot carry this panel's fragment -- so the topic is persisted the first
+  // time the QR link is opened and read back whenever the fragment is absent.
+  var STORE_KEY = "panel.topic";
+
+  function remember(t) {
+    try { localStorage.setItem(STORE_KEY, t); } catch (e) { /* private mode */ }
+  }
+  function recall() {
+    try { return localStorage.getItem(STORE_KEY) || ""; } catch (e) { return ""; }
+  }
+
+  var topic = readTopic();
+  if (topic) {
+    remember(topic);          // fresh scan wins, and re-pairing just overwrites
+  } else {
+    topic = recall();
+  }
+
+  var wrap  = document.getElementById("wrap");
+
+  if (!topic) {
+    wrap.innerHTML =
+      '<div class="nolink"><strong>No panel linked</strong>' +
+      'Open your panel, go to Settings &rsaquo; Network &rsaquo; Phone setup, ' +
+      'and scan the code shown there.</div>';
+    return;
+  }
+
+  var CMD_URL = "https://ntfy.sh/" + topic + "-cmd";
+
+  document.getElementById("badge").textContent      = topic;
+  document.getElementById("topic-text").textContent = topic;
+
+  // ---- Status line -------------------------------------------------------
+  var statusEl = document.getElementById("status");
+  var statusTimer = null;
+
+  function say(msg, isError) {
+    statusEl.textContent = msg;
+    statusEl.classList.toggle("err", !!isError);
+    statusEl.classList.add("show");
+    clearTimeout(statusTimer);
+    statusTimer = setTimeout(function () {
+      statusEl.classList.remove("show");
+    }, 4200);
+  }
+
+  // ---- Sending -----------------------------------------------------------
+  // The panel confirms every command with its own push notification, so the
+  // page never needs to read a response. It still tries a normal request
+  // first (to catch a genuine network failure and say so) and falls back to
+  // no-cors, which always goes through regardless of CORS headers.
+  function send(cmd, btn, restore) {
+    btn.disabled = true;
+    say("Sending…");
+
+    fetch(CMD_URL, { method: "POST", body: cmd })
+      .then(function () {
+        say("Sent — watch for the confirmation.");
+      })
+      .catch(function () {
+        return fetch(CMD_URL, { method: "POST", body: cmd, mode: "no-cors" })
+          .then(function () { say("Sent — watch for the confirmation."); })
+          .catch(function () { say("No connection. Try again.", true); });
+      })
+      .then(function () {
+        btn.disabled = false;
+        btn.textContent = restore;
+        btn.classList.remove("confirm");
+      });
+  }
+
+  // ---- Wiring ------------------------------------------------------------
+  // Destructive actions ask twice: a pocket tap must never reboot the panel
+  // or open the update window mid-evening.
+  var pendingTimer = null;
+
+  function wire(id, cmd) {
+    var btn   = document.getElementById(id);
+    var label = btn.textContent;
+    var armed = false;
+
+    btn.addEventListener("click", function () {
+      if (btn.dataset.confirm && !armed) {
+        armed = true;
+        btn.textContent = "Tap again to confirm";
+        btn.classList.add("confirm");
+        clearTimeout(pendingTimer);
+        pendingTimer = setTimeout(function () {
+          armed = false;
+          btn.textContent = label;
+          btn.classList.remove("confirm");
+        }, 3500);
+        return;
+      }
+      clearTimeout(pendingTimer);
+      armed = false;
+      send(cmd, btn, label);
+    });
+  }
+
+  wire("btn-off",     "off");
+  wire("btn-status",  "status");
+  wire("btn-restart", "restart");
+  wire("btn-update",  "update");
+
+  // ---- Copy topic --------------------------------------------------------
+  document.getElementById("btn-copy").addEventListener("click", function () {
+    var btn = this;
+    function done() {
+      btn.textContent = "Copied";
+      setTimeout(function () { btn.textContent = "Copy"; }, 1800);
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(topic).then(done).catch(fallback);
+    } else {
+      fallback();
+    }
+    function fallback() {
+      // Older iOS Safari: select the text so one long-press copies it.
+      var r = document.createRange();
+      r.selectNodeContents(document.getElementById("topic-text"));
+      var s = window.getSelection();
+      s.removeAllRanges();
+      s.addRange(r);
+      done();
+    }
+  });
+})();
+</script>
+</body>
+</html>
