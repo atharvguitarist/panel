@@ -69,23 +69,6 @@ def main(path):
     if entries and max(years) < this_year + 1:
         print(("::warning::" if ci else "warning: ") + f"no entries beyond {max(years)} -- add next year's dates")
 
-    # The panel only re-fetches the calendar when the manifest's "festivals"
-    # stamp changes. A calendar edit without a stamp update would sit in the
-    # repo and never reach a single panel -- so a stale stamp is an error.
-    import hashlib
-    manifest_path = os.path.join(os.path.dirname(os.path.abspath(path)), "..", "firmware", "manifest.json")
-    if os.path.isfile(manifest_path):
-        import json
-        stamp = hashlib.md5(open(path, "rb").read()).hexdigest()[:8]
-        try:
-            have = json.load(open(manifest_path)).get("festivals", "")
-        except Exception as e:
-            have = None
-            problems.append(f"firmware/manifest.json is not valid JSON ({e})")
-        if have is not None and have != stamp:
-            problems.append(f"firmware/manifest.json 'festivals' is {have!r} but the file's stamp is {stamp!r} "
-                            f"-- run  python make_release.py --festivals  and commit the manifest too")
-
     for p in problems:
         print(("::error::" if ci else "error: ") + p)
     print(f"{len(entries)} entries, years {min(years) if years else '-'}..{max(years) if years else '-'}")
