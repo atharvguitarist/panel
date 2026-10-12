@@ -41,6 +41,12 @@
   The installed app then launches with the topic in its own URL, no storage
   required. localStorage is kept as a second net, and the no-panel screen
   offers a paste box as a third.
+
+  INSTALL PROMPT: Android Chrome fires beforeinstallprompt once the page has a
+  manifest and a service worker with a real fetch handler (sw.js); the banner
+  then offers a one-tap "Add" that opens the browser's own install sheet.
+  iOS has no install API at all, so the banner shows the two taps instead.
+  Neither banner ever renders inside the installed app.
 -->
 
 <style>
@@ -249,6 +255,52 @@
     color: #9A9387;
   }
 
+  /* ---- Add-to-home-screen banner ----
+     Only exists while the page is open in a browser tab. Inside the installed
+     app it is never rendered. Android gets a real one-tap install (the
+     browser's own prompt); iPhone has no such API, so it gets a pointed
+     two-step hint instead. */
+  .install {
+    display: none;
+    align-items: center;
+    gap: 12px;
+    margin: -8px 0 18px;
+    padding: 12px 14px;
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    box-shadow: 0 2px 8px var(--shadow);
+    font-size: 13.5px;
+    line-height: 1.45;
+    color: var(--ink-soft);
+  }
+  .install.show { display: flex; }
+  .install strong { color: var(--ink); font-weight: 600; }
+  .install .add {
+    flex: 0 0 auto;
+    width: auto;
+    padding: 10px 16px;
+    font-size: 13.5px;
+    font-weight: 600;
+    letter-spacing: .03em;
+    color: #FBEFE2;
+    background: var(--wine);
+    border: none;
+    border-radius: 11px;
+  }
+  .install .later {
+    flex: 0 0 auto;
+    width: 30px; height: 30px;
+    padding: 0;
+    font-size: 18px;
+    line-height: 1;
+    color: var(--ink-soft);
+    background: transparent;
+    border: none;
+  }
+  .install svg { width: 17px; height: 17px; vertical-align: -3px; stroke: var(--ink); fill: none; stroke-width: 1.8; }
+  .install .text { flex: 1; }
+
   /* Shown instead of everything when the link carries no topic. */
   .nolink {
     text-align: center;
@@ -284,6 +336,12 @@
     <div class="topic-badge" id="badge"></div>
   </header>
 
+  <div class="install" id="install" role="note">
+    <div class="text" id="install-text"></div>
+    <button class="add" id="install-add">Add</button>
+    <button class="later" id="install-later" aria-label="Not now">&times;</button>
+  </div>
+
   <button class="primary" id="btn-off">All Lights Off</button>
 
   <div class="grid">
@@ -313,7 +371,7 @@
     </div>
   </div>
 
-  <footer>
+  <footer id="foot">
     Add this page to your home screen for one-tap access.<br>
     Commands reach the panel from anywhere.
   </footer>
@@ -418,6 +476,65 @@
       link.href = URL.createObjectURL(blob);
       document.head.appendChild(link);
     } catch (e) { /* no manifest: the apple-* meta tags and the URL still carry it */ }
+  })();
+
+  // ---- Service worker ---------------------------------------------------
+  // Required for the browser's install prompt on Android, and gives the page
+  // an offline shell (the buttons still need the network; the page itself
+  // does not). Registered with the plain relative path so it scopes to this
+  // folder only.
+  if ("serviceWorker" in navigator) {
+    try { navigator.serviceWorker.register("./sw.js"); } catch (e) { /* optional */ }
+  }
+
+  // ---- Add to home screen -------------------------------------------------
+  (function installUx() {
+    var standalone = (window.matchMedia && window.matchMedia("(display-mode: standalone)").matches) ||
+                     navigator.standalone === true;
+    var foot = document.getElementById("foot");
+    if (standalone) {               // already installed: nothing to suggest
+      if (foot) foot.innerHTML = "Commands reach the panel from anywhere.";
+      return;
+    }
+    var box   = document.getElementById("install");
+    var text  = document.getElementById("install-text");
+    var add   = document.getElementById("install-add");
+    var later = document.getElementById("install-later");
+    var DISMISS_KEY = "panel.install.later";
+    function dismissed() { try { return sessionStorage.getItem(DISMISS_KEY) === "1"; } catch (e) { return false; } }
+    later.addEventListener("click", function () {
+      box.classList.remove("show");
+      try { sessionStorage.setItem(DISMISS_KEY, "1"); } catch (e) { /* ignore */ }
+    });
+
+    var ua = navigator.userAgent || "";
+    var isIOS = /iPhone|iPad|iPod/.test(ua) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+
+    // Android / Chrome: the browser hands us its own install prompt. One tap.
+    var deferred = null;
+    window.addEventListener("beforeinstallprompt", function (e) {
+      e.preventDefault();
+      deferred = e;
+      if (dismissed()) return;
+      text.innerHTML = "<strong>Add to your home screen</strong><br>One tap, then it opens like an app.";
+      add.style.display = "";
+      box.classList.add("show");
+    });
+    add.addEventListener("click", function () {
+      if (!deferred) return;
+      deferred.prompt();
+      deferred.userChoice.then(function () { deferred = null; box.classList.remove("show"); });
+    });
+    window.addEventListener("appinstalled", function () { box.classList.remove("show"); });
+
+    // iPhone: Safari has no install API. Point at the exact two taps.
+    if (isIOS && !dismissed()) {
+      var share = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12M8 7l4-4 4 4M5 12v7a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-7" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+      text.innerHTML = "<strong>Add to your home screen</strong><br>Tap " + share +
+                       " below, then <strong>Add to Home Screen</strong>.";
+      add.style.display = "none";
+      box.classList.add("show");
+    }
   })();
 
   var CMD_URL = "https://ntfy.sh/" + topic + "-cmd";
