@@ -696,7 +696,7 @@
       });
     }
 
-    var published = fetch("firmware/manifest.json", { cache: "no-store" })
+    var published = fetch("firmware/manifest.json?t=" + Date.now(), { cache: "no-store" })
       .then(function (r) { return r.ok ? r.json() : {}; })
       .then(function (m) { return (m && m.version) || ""; })
       .catch(function () { return ""; });
