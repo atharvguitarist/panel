@@ -13,7 +13,6 @@
 <meta name="theme-color" content="#F6E9CC">
 <meta name="robots" content="noindex,nofollow">
 
-<link rel="manifest" href="manifest.json">
 <link rel="apple-touch-icon" href="apple-touch-icon.png">
 <link rel="icon" type="image/png" sizes="192x192" href="icon-192.png">
 
@@ -31,11 +30,17 @@
   correctly, so the page uses the real palette and the two still read as one
   product side by side.
 
-  INSTALLED-APP BEHAVIOUR: a manifest cannot carry a per-panel start_url, so
-  an Android launch from the home screen opens "./" with NO fragment. The
-  topic is therefore remembered in localStorage the first time the QR link is
-  opened, and read back when the fragment is absent. iOS keeps the fragment
-  in the saved bookmark, so both routes work -- belt and braces.
+  INSTALLED-APP BEHAVIOUR: when a manifest is present, BOTH platforms launch
+  the installed app at the manifest's start_url, not the page the user was
+  on -- and on iOS the installed app's storage is a separate container from
+  Safari's, so nothing stored during the first visit is visible afterwards.
+  A static manifest therefore cannot work: its start_url has no topic.
+
+  So the manifest is generated at runtime, after the topic is known, as a
+  blob: URL whose start_url is this page's absolute URL WITH the #t= fragment.
+  The installed app then launches with the topic in its own URL, no storage
+  required. localStorage is kept as a second net, and the no-panel screen
+  offers a paste box as a third.
 -->
 
 <style>
@@ -354,12 +359,66 @@
   var wrap  = document.getElementById("wrap");
 
   if (!topic) {
+    // Recovery path for any launch that arrives without a topic: the topic
+    // is printed on the panel's Phone Setup screen, so it can be pasted.
     wrap.innerHTML =
       '<div class="nolink"><strong>No panel linked</strong>' +
       'Open your panel, go to Settings &rsaquo; Network &rsaquo; Phone setup, ' +
-      'and scan the code shown there.</div>';
+      'and scan the code shown there.<br><br>' +
+      'Or enter the topic shown on that screen:' +
+      '<div class="topic-row" style="margin-top:14px">' +
+      '<input id="paste" inputmode="text" autocapitalize="none" autocorrect="off" ' +
+      'spellcheck="false" placeholder="e.g. pine-terrace-efyf" ' +
+      'style="flex:1;border:0;background:transparent;font:inherit;font-size:14px;' +
+      'color:var(--ink);outline:none;min-width:0">' +
+      '<button class="copy" id="paste-go">Link</button></div></div>';
+    var go = function () {
+      var v = (document.getElementById("paste").value || "").trim().toLowerCase();
+      v = (v.match(/[a-z0-9_-]+/g) || []).join("").slice(0, 64);
+      if (!v) return;
+      remember(v);
+      location.replace(location.pathname + "#t=" + v);
+      location.reload();
+    };
+    document.getElementById("paste-go").addEventListener("click", go);
+    document.getElementById("paste").addEventListener("keydown", function (e) {
+      if (e.key === "Enter") go();
+    });
     return;
   }
+
+  // ---- Runtime manifest -----------------------------------------------
+  // Built here, after the topic is known, so the installed app's start_url
+  // carries THIS panel's topic. Absolute URLs throughout: a blob: manifest
+  // has no base to resolve relative paths against.
+  (function installManifest() {
+    var base = location.origin + location.pathname.replace(/[^\/]*$/, "");
+    var self = location.origin + location.pathname;
+    var manifest = {
+      id: self + "#t=" + topic,
+      name: "Front Door Panel",
+      short_name: "Panel",
+      description: "Controls for your door panel.",
+      start_url: self + "#t=" + topic,
+      scope: base,
+      display: "standalone",
+      orientation: "portrait",
+      background_color: "#F6E9CC",
+      theme_color: "#F6E9CC",
+      icons: [
+        { src: base + "icon-192.png", sizes: "192x192", type: "image/png", purpose: "any" },
+        { src: base + "icon-512.png", sizes: "512x512", type: "image/png", purpose: "any" },
+        { src: base + "icon-maskable-512.png", sizes: "512x512", type: "image/png", purpose: "maskable" }
+      ]
+    };
+    try {
+      var blob = new Blob([JSON.stringify(manifest)], { type: "application/manifest+json" });
+      var link = document.createElement("link");
+      link.rel = "manifest";
+      link.href = URL.createObjectURL(blob);
+      document.head.appendChild(link);
+    } catch (e) { /* no manifest: the apple-* meta tags and the URL still carry it */ }
+  })();
 
   var CMD_URL = "https://ntfy.sh/" + topic + "-cmd";
 
