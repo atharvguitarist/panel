@@ -1,0 +1,45 @@
+name: Publish release
+
+# Upload Panel_vX.ino.bin into firmware/ (any name) and/or edit
+# config/festivals.txt -- this does the rest: renames the binary to
+# latest.bin, reads its version, computes size + md5, validates and stamps
+# the festival calendar, writes firmware/manifest.json, commits it, and
+# redeploys the page. Uses no third-party actions.
+on:
+  push:
+    branches: [main]
+    paths: ["firmware/**", "config/festivals.txt", "tools/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # commit the manifest
+  pages: write      # request a Pages rebuild
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build manifest
+        id: pub
+        run: python3 -I tools/publish.py
+
+      - name: Commit
+        if: steps.pub.outputs.changed == 'true'
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A firmware
+          git commit -m "Publish v${{ steps.pub.outputs.version }}"
+          git push
+
+      - name: Redeploy page
+        if: steps.pub.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X POST "repos/${{ github.repository }}/pages/builds" || echo "Pages will pick it up on its own"
