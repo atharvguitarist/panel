@@ -301,6 +301,40 @@
   .install svg { width: 17px; height: 17px; vertical-align: -3px; stroke: var(--ink); fill: none; stroke-width: 1.8; }
   .install .text { flex: 1; }
 
+  /* ---- Update row ----
+     Absent unless the panel answered with its version AND the published
+     release is newer. One quiet line, one button. */
+  .update {
+    display: none;
+    align-items: center;
+    gap: 12px;
+    margin-top: 14px;
+    padding: 12px 14px;
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    box-shadow: 0 2px 8px var(--shadow);
+    font-size: 13.5px;
+    line-height: 1.45;
+    color: var(--ink-soft);
+  }
+  .update.show { display: flex; }
+  .update .text { flex: 1; }
+  .update strong { color: var(--ink); font-weight: 600; }
+  .update button {
+    flex: 0 0 auto;
+    width: auto;
+    padding: 10px 16px;
+    font-size: 13.5px;
+    font-weight: 600;
+    letter-spacing: .03em;
+    color: #FBEFE2;
+    background: var(--wine);
+    border: none;
+    border-radius: 11px;
+  }
+  .update button.confirm { background: var(--wine-dark); }
+
   /* Shown instead of everything when the link carries no topic. */
   .nolink {
     text-align: center;
@@ -348,6 +382,11 @@
     <button class="secondary" id="btn-status">Check Status</button>
     <button class="secondary" id="btn-restart" data-confirm="1">Restart Panel</button>
     <button class="secondary wide" id="btn-update" data-confirm="1">Allow Update &middot; 5 min</button>
+  </div>
+
+  <div class="update" id="update" role="note">
+    <div class="text" id="update-text"></div>
+    <button id="btn-upgrade">Update</button>
   </div>
 
   <div class="status" id="status"></div>
@@ -614,6 +653,92 @@
   wire("btn-status",  "status");
   wire("btn-restart", "restart");
   wire("btn-update",  "update");
+
+  // ---- Firmware update check ----------------------------------------------
+  // The panel is asked which version it runs ("ver"); it answers on the
+  // side topic <topic>-ver, which no phone subscribes to, so nothing pings.
+  // The published version comes from firmware/manifest.json on this same
+  // host. The row appears only if the published one is newer. Older
+  // firmware that doesn't know "ver" simply never answers: no row.
+  (function updateCheck() {
+    var box  = document.getElementById("update");
+    var text = document.getElementById("update-text");
+    var btn  = document.getElementById("btn-upgrade");
+    var badge = document.getElementById("badge");
+    var VER_URL = "https://ntfy.sh/" + topic + "-ver/json?poll=1&since=";
+
+    function parts(v) { return String(v || "").split(".").map(function (n) { return parseInt(n, 10) || 0; }); }
+    function newer(a, b) {
+      var x = parts(a), y = parts(b);
+      for (var i = 0; i < 3; i++) { if ((x[i] || 0) !== (y[i] || 0)) return (x[i] || 0) > (y[i] || 0); }
+      return false;
+    }
+
+    function askPanel() {
+      var since = Math.floor(Date.now() / 1000) - 2;
+      fetch(CMD_URL, { method: "POST", body: "ver", mode: "no-cors" }).catch(function () {});
+      return new Promise(function (resolve) {
+        var tries = 0;
+        (function poll() {
+          tries++;
+          fetch(VER_URL + since, { cache: "no-store" })
+            .then(function (r) { return r.text(); })
+            .then(function (body) {
+              var found = "";
+              body.split("\n").forEach(function (line) {
+                try { var m = JSON.parse(line); if (m.event === "message" && /^\d+\.\d+\.\d+$/.test(m.message)) found = m.message; } catch (e) {}
+              });
+              if (found) return resolve(found);
+              if (tries < 8) setTimeout(poll, 1500); else resolve("");
+            })
+            .catch(function () { if (tries < 8) setTimeout(poll, 1500); else resolve(""); });
+        })();
+      });
+    }
+
+    var published = fetch("firmware/manifest.json", { cache: "no-store" })
+      .then(function (r) { return r.ok ? r.json() : {}; })
+      .then(function (m) { return (m && m.version) || ""; })
+      .catch(function () { return ""; });
+
+    // A beat after load, so opening the page stays instant.
+    setTimeout(function () {
+      Promise.all([askPanel(), published]).then(function (v) {
+        var running = v[0], latest = v[1];
+        if (!running) return;                       // panel offline or older firmware
+        badge.textContent = topic + "  \u00b7  v" + running;
+        if (!latest || !newer(latest, running)) return;
+        text.innerHTML = "<strong>Update available</strong><br>Version " + latest +
+                         " &middot; you have " + running;
+        box.classList.add("show");
+      });
+    }, 600);
+
+    var armed = false, armTimer = null;
+    btn.addEventListener("click", function () {
+      if (!armed) {
+        armed = true;
+        btn.textContent = "Tap again";
+        btn.classList.add("confirm");
+        armTimer = setTimeout(function () { armed = false; btn.textContent = "Update"; btn.classList.remove("confirm"); }, 3500);
+        return;
+      }
+      clearTimeout(armTimer);
+      armed = false;
+      btn.disabled = true;
+      fetch(CMD_URL, { method: "POST", body: "upgrade", mode: "no-cors" })
+        .then(function () {
+          text.innerHTML = "<strong>Updating</strong><br>The panel restarts by itself in about a minute.";
+          btn.style.display = "none";
+        })
+        .catch(function () {
+          btn.disabled = false;
+          btn.textContent = "Update";
+          btn.classList.remove("confirm");
+          say("No connection. Try again.", true);
+        });
+    });
+  })();
 
   // ---- Copy topic --------------------------------------------------------
   document.getElementById("btn-copy").addEventListener("click", function () {
