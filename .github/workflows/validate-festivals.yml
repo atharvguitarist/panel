@@ -1,0 +1,21 @@
+name: Validate festival dates
+
+# Runs on every change to the festival file. Read-only: it never commits,
+# never pushes. Uses only GitHub's own checkout action.
+on:
+  push:
+    paths: ["config/festivals.txt", "tools/validate_festivals.py", "firmware/manifest.json"]
+  pull_request:
+    paths: ["config/festivals.txt"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check config/festivals.txt
+        run: python3 -I tools/validate_festivals.py config/festivals.txt
