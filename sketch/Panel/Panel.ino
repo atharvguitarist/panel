@@ -363,16 +363,6 @@ uint8_t pcfState = 0xFF;
 
 Preferences prefs;
 
-// Update breadcrumb, kept in NVS so a crash during an update names its own
-// stage on the next boot (UI/boot thread only).
-//   1 saving to card   2 staged on card   3 restart issued
-//   4 boot installer writing flash   5 installer finished, restarting
-static void fwStageMark(uint8_t stage) {
-  prefs.begin("doorpanel", false);
-  prefs.putUChar("updstage", stage);
-  prefs.end();
-}
-
 bool ceilingState = false;
 
 enum AutoMode {
@@ -5352,6 +5342,16 @@ static void fwUpgradeTask(void *param) {
   firmwareUpdateResult = FWR_DOWNLOADED;
   firmwareDownloadActive = false;
   vTaskDelete(nullptr);
+}
+
+// Update breadcrumb, kept in NVS so a crash during an update names its own
+// stage on the next boot (UI/boot thread only).
+//   1 saving to card   2 staged on card   3 restart issued
+//   4 boot installer writing flash   5 installer finished, restarting
+static void fwStageMark(uint8_t stage) {
+  prefs.begin("doorpanel", false);
+  prefs.putUChar("updstage", stage);
+  prefs.end();
 }
 
 // UI thread: write the verified image to the card, read it back and check
