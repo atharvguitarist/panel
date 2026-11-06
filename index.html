@@ -153,6 +153,11 @@
     color: #5F4712;
   }
 
+  /* A command the panel confirmed: a short gold tick on the button itself,
+     the way a remote's LED blinks. Kept brief so it reads as feedback. */
+  .primary.sent   { background: #A8842E; }
+  .secondary.sent { background: #F6E2AE; border-color: #C9A85C; color: #5F4712; }
+
   /* ---- Status line ---- */
   .status {
     margin-top: 16px;
@@ -454,9 +459,8 @@
 
   <div class="grid">
     <button class="secondary" id="btn-status">Check Status</button>
-    <button class="secondary" id="btn-restart" data-confirm="1">Restart Panel</button>
-    <button class="secondary" id="btn-update" data-confirm="1">Allow Update &middot; 5 min</button>
     <button class="secondary" id="btn-log">Recent Alerts</button>
+    <button class="secondary wide" id="btn-restart" data-confirm="1">Restart Panel</button>
   </div>
 
   <div class="update" id="update" role="status" aria-live="polite">
@@ -767,6 +771,17 @@
     return verInFlight;
   }
 
+  // ---- Confirmed-tick feedback -------------------------------------------
+  // A short vibration on phones that allow it (Android; iPhone Safari has no
+  // vibration API, so the visual tick carries it there) plus a one-second
+  // gold flash with a checkmark on the button that was pressed.
+  function tick(btn, label) {
+    try { if (navigator.vibrate) navigator.vibrate(18); } catch (e) { /* ignore */ }
+    btn.classList.add("sent");
+    btn.textContent = "\u2713  " + label;
+    setTimeout(function () { btn.classList.remove("sent"); btn.textContent = label; }, 1100);
+  }
+
   // ---- Sending -----------------------------------------------------------
   // Tries a normal request first (to catch a genuine network failure and say
   // so) and falls back to no-cors, which always goes through regardless of
@@ -793,6 +808,7 @@
         return waitReply(since, 18000).then(function (reply) {
           if (reply) {
             say(reply, false, 9000);
+            tick(btn, restore);
             link.online();
             if (/^Restarting/.test(reply)) setTimeout(function () { link.check(); }, 35000);
           } else {
@@ -805,7 +821,7 @@
 
   // ---- Wiring ------------------------------------------------------------
   // Destructive actions ask twice: a pocket tap must never reboot the panel
-  // or open the update window mid-evening.
+  // mid-evening.
   var pendingTimer = null;
 
   function wire(id, cmd) {
@@ -835,7 +851,6 @@
   wire("btn-off",     "off");
   wire("btn-status",  "status");
   wire("btn-restart", "restart");
-  wire("btn-update",  "update");
 
   // ---- Link check, update offer, update progress ---------------------------
   // On open the panel is asked for its version. If it answers, the published
