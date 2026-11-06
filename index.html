@@ -345,33 +345,61 @@
   }
   .update button.confirm { background: var(--wine-dark); }
 
-  /* ---- Activity (read from the relay's 12-hour cache; the panel is never asked) ---- */
-  .log { margin-top: 14px; display: none; }
-  .log.show { display: block; }
+  /* ---- Activity sheet ----
+     Opens over the remote; the page itself never grows. Content is the
+     relay's 12-hour cache, read by the phone -- the panel is never asked. */
+  .sheet-bg {
+    position: fixed; inset: 0;
+    background: rgba(40,30,20,.35);
+    opacity: 0; pointer-events: none;
+    transition: opacity .2s ease;
+    z-index: 20;
+  }
+  .sheet {
+    position: fixed; left: 0; right: 0; bottom: 0;
+    max-height: 72vh;
+    margin: 0 auto; max-width: 480px;
+    display: flex; flex-direction: column;
+    background: var(--card);
+    border: 1px solid var(--line); border-bottom: 0;
+    border-radius: 20px 20px 0 0;
+    box-shadow: 0 -8px 30px rgba(0,0,0,.18);
+    transform: translateY(105%);
+    transition: transform .25s ease;
+    z-index: 21;
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+  .sheet-bg.open { opacity: 1; pointer-events: auto; }
+  .sheet.open    { transform: none; }
+  .sheet-head {
+    display: flex; align-items: center; gap: 10px;
+    padding: 16px 18px 10px;
+  }
+  .sheet-head h2 {
+    flex: 1; margin: 0;
+    font-size: 14px; font-weight: 600; letter-spacing: .13em; text-transform: uppercase;
+    color: var(--gold-text);
+  }
+  .sheet-head small { display: block; margin-top: 2px; font-size: 12px; font-weight: 400; letter-spacing: 0; text-transform: none; color: var(--ink-soft); }
+  .sheet-head button {
+    width: 32px; height: 32px; padding: 0; flex: 0 0 auto;
+    font-size: 20px; line-height: 1; border-radius: 50%;
+    color: var(--ink-soft); background: var(--bg); border: 1px solid var(--line);
+  }
+  .log { overflow-y: auto; -webkit-overflow-scrolling: touch; padding: 0 18px 14px; }
   .log-row {
-    display: flex;
-    gap: 10px;
+    display: flex; gap: 10px;
     padding: 9px 0;
     border-top: 1px solid var(--line);
-    font-size: 13px;
-    line-height: 1.4;
+    font-size: 13px; line-height: 1.4;
   }
   .log-row:first-child { border-top: 0; }
-  .log-time { flex: 0 0 52px; color: var(--ink-soft); font-variant-numeric: tabular-nums; }
+  .log-time { flex: 0 0 48px; color: var(--ink-soft); font-variant-numeric: tabular-nums; }
   .log-text { flex: 1; min-width: 0; color: var(--ink); word-break: break-word; }
   .log-text em { font-style: normal; color: var(--ink-soft); }
   .log-row.ok .log-text { color: var(--gold-text); }
-  .log-empty { padding: 10px 0; font-size: 13px; color: var(--ink-soft); }
-  .card .actions { display: flex; gap: 10px; }
-  .card .actions button {
-    width: auto; flex: 1;
-    padding: 11px 10px;
-    font-size: 13px; font-weight: 500;
-    color: var(--gold-text);
-    background: var(--bg);
-    border: 1px solid var(--line);
-    border-radius: 11px;
-  }
+  .log-empty { padding: 14px 0 10px; font-size: 13px; color: var(--ink-soft); text-align: center; }
+
   .update .steps { margin-top: 6px; font-size: 12px; color: var(--ink-soft); letter-spacing: .02em; }
   .update .steps b { color: var(--ink); font-weight: 600; }
   .update.fail strong { color: #A3302B; }
@@ -427,7 +455,8 @@
   <div class="grid">
     <button class="secondary" id="btn-status">Check Status</button>
     <button class="secondary" id="btn-restart" data-confirm="1">Restart Panel</button>
-    <button class="secondary wide" id="btn-update" data-confirm="1">Allow Update &middot; 5 min</button>
+    <button class="secondary" id="btn-update" data-confirm="1">Allow Update &middot; 5 min</button>
+    <button class="secondary" id="btn-log">Activity</button>
   </div>
 
   <div class="update" id="update" role="status" aria-live="polite">
@@ -456,22 +485,21 @@
     </div>
   </div>
 
-  <div class="card" style="margin-top:14px">
-    <h2>Activity</h2>
-    <p>The last 12 hours of alerts and confirmations, read from the notification
-       relay &mdash; nothing is asked of the panel.</p>
-    <div class="actions">
-      <button id="btn-log">Show activity</button>
-    </div>
-    <div class="log" id="log"></div>
-  </div>
-
   <footer>
     <span id="foot">Add this page to your home screen for one-tap access.<br>
     Commands reach the panel from anywhere.</span><br>
     <a href="#" id="relink" class="relink">Different panel? Re-link</a>
   </footer>
 
+</div>
+
+<div class="sheet-bg" id="sheet-bg"></div>
+<div class="sheet" id="sheet" role="dialog" aria-label="Activity">
+  <div class="sheet-head">
+    <h2>Activity<small>Last 12 hours</small></h2>
+    <button id="sheet-close" aria-label="Close">&times;</button>
+  </div>
+  <div class="log" id="log"></div>
 </div>
 
 <script>
@@ -979,42 +1007,45 @@
     };
   })();
 
-  // ---- Activity ------------------------------------------------------------
+  // ---- Activity sheet -------------------------------------------------------
   // Everything the panel has pushed in the last 12 hours -- doorbell, motion,
   // light notices and its replies to commands -- straight from the relay's
   // cache. The panel is not contacted; this is the phone reading ntfy.
   (function activity() {
     var btnLog = document.getElementById("btn-log");
+    var sheet  = document.getElementById("sheet");
+    var bg     = document.getElementById("sheet-bg");
     var list   = document.getElementById("log");
-    var open = false;
 
     function esc(s) { return String(s).replace(/[&<>]/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]; }); }
     function hhmm(t) {
       var d = new Date(t * 1000), h = d.getHours(), m = d.getMinutes();
       return (h < 10 ? "0" : "") + h + ":" + (m < 10 ? "0" : "") + m;
     }
-    function load() {
-      btnLog.disabled = true; btnLog.textContent = "Loading…";
+    function open() {
+      sheet.classList.add("open"); bg.classList.add("open");
+      list.innerHTML = '<div class="log-empty">Loading…</div>';
       pollTopic(MAIN_URL, "12h").then(function (msgs) {
         msgs.sort(function (a, b) { return b.time - a.time; });
         msgs = msgs.slice(0, 80);
         if (!msgs.length) {
           list.innerHTML = '<div class="log-empty">Nothing in the last 12 hours.</div>';
-        } else {
-          list.innerHTML = msgs.map(function (m) {
-            var ok = m.message.indexOf(MARK) === 0;
-            var body = ok ? m.message.slice(MARK.length) : m.message;
-            var title = ok ? "" : (m.title ? "<em>" + esc(m.title) + " &middot; </em>" : "");
-            return '<div class="log-row' + (ok ? " ok" : "") + '"><div class="log-time">' + hhmm(m.time) +
-                   '</div><div class="log-text">' + title + esc(body) + '</div></div>';
-          }).join("");
+          return;
         }
-        list.classList.add("show");
-        open = true;
-        btnLog.disabled = false; btnLog.textContent = "Refresh";
+        list.innerHTML = msgs.map(function (m) {
+          var ok = m.message.indexOf(MARK) === 0;
+          var body = ok ? m.message.slice(MARK.length) : m.message;
+          var title = ok ? "" : (m.title ? "<em>" + esc(m.title) + " &middot; </em>" : "");
+          return '<div class="log-row' + (ok ? " ok" : "") + '"><div class="log-time">' + hhmm(m.time) +
+                 '</div><div class="log-text">' + title + esc(body) + '</div></div>';
+        }).join("");
       });
     }
-    btnLog.addEventListener("click", load);
+    function close() { sheet.classList.remove("open"); bg.classList.remove("open"); }
+    btnLog.addEventListener("click", open);
+    bg.addEventListener("click", close);
+    document.getElementById("sheet-close").addEventListener("click", close);
+    document.addEventListener("keydown", function (e) { if (e.key === "Escape") close(); });
   })();
 
   // ---- Copy topic --------------------------------------------------------
