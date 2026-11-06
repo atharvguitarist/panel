@@ -65,6 +65,14 @@ jobs:
           "$NM" -n --defined-only out/Panel.ino.elf | awk '$2 ~ /^[tTwW]$/ {print $1, $3}' | gzip -9 > firmware/symbols.txt.gz
           ls -l firmware/symbols.txt.gz
 
+      - name: Build report (run summary)
+        run: |
+          BIN=$(ls "$HOME"/.arduino15/packages/esp32/tools/xtensa-esp32s3-elf-gcc/*/bin | head -1)
+          "$BIN/xtensa-esp32s3-elf-size" -A out/Panel.ino.elf > out/size.txt
+          git show HEAD:firmware/manifest.json > out/prev.json 2>/dev/null || echo '{}' > out/prev.json
+          python3 -I tools/build_report.py out/size.txt out/Panel.ino.bin out/prev.json sketch/versions.env >> "$GITHUB_STEP_SUMMARY"
+          cat "$GITHUB_STEP_SUMMARY"
+
       - name: Size check (slot is 1,966,080 bytes)
         run: |
           ls -l out
@@ -84,7 +92,13 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A firmware
           git commit -m "Build v${{ steps.pub.outputs.version }}"
-          git push
+          # The branch may have moved while the build ran (a README edit, the
+          # next sketch push). Rebase our one commit onto it and push; three
+          # tries covers another build landing in the same window.
+          for i in 1 2 3; do
+            git push && break
+            git pull --rebase origin main || exit 1
+          done
 
       - name: Redeploy page
         if: steps.pub.outputs.changed == 'true'
