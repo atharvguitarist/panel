@@ -481,8 +481,10 @@
       'color:var(--ink);outline:none;min-width:0">' +
       '<button class="copy" id="paste-go">Link</button></div></div>';
     var go = function () {
-      var v = (document.getElementById("paste").value || "").trim().toLowerCase();
-      v = (v.match(/[a-z0-9_-]+/g) || []).join("").slice(0, 64);
+      // Case is kept: ntfy topics are case-sensitive and the panel stores its
+      // topic exactly as entered, so "Aravanya" and "aravanya" are different.
+      var v = (document.getElementById("paste").value || "").trim();
+      v = (v.match(/[A-Za-z0-9_-]+/g) || []).join("").slice(0, 64);
       if (!v) return;
       remember(v);
       location.replace(location.pathname + "#t=" + v);
