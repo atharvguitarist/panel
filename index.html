@@ -129,12 +129,71 @@
   .primary:active { background: var(--wine-dark); }
   .primary.confirm { background: var(--wine-dark); }
 
-  .primary-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-  .primary-row .primary { padding: 30px 12px; font-size: 19px; }
-  /* Lights On: the warm, lit counterpart to the burgundy Off. */
-  .primary.on { background: #C9A85C; color: #3D2A08; box-shadow: 0 6px 18px rgba(201,168,92,.32); }
-  .primary.on:active { background: #B8963F; }
-  .primary.on.sent { background: #E3C77A; }
+  .primary.wide { padding: 26px 20px; font-size: 20px; margin-top: 12px; }
+
+  /* ---- Lights: one switch per light, named as on the panel ----
+     Two columns so the remote stays one screen; tap the name to rename. */
+  .lights {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 12px;
+  }
+  .light {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 16px;
+    padding: 13px 12px 11px;
+    box-shadow: 0 2px 8px var(--shadow);
+    display: flex; flex-direction: column; align-items: center; gap: 7px;
+    transition: background-color .25s ease, border-color .25s ease;
+  }
+  .light.on { background: #FFF6DC; border-color: #E2C98A; }
+  .light .name {
+    width: 100%; padding: 2px 0; margin: 0;
+    font-size: 14px; font-weight: 600; letter-spacing: .015em;
+    color: var(--ink); background: none; border: 0; border-radius: 8px;
+    text-align: center; line-height: 1.25;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .light .name::after { content: " \270E"; font-size: 11px; color: var(--ink-soft); font-weight: 400; }
+  .light .mode {
+    font-size: 11px; letter-spacing: .05em; text-transform: uppercase;
+    color: var(--ink-soft); min-height: 13px;
+  }
+  .light.on .mode { color: var(--gold-text); }
+  /* The switch */
+  .sw {
+    width: 50px; height: 29px; padding: 0; flex: 0 0 auto;
+    border-radius: 999px; border: 0;
+    background: #D9CEB5; position: relative;
+    box-shadow: inset 0 1px 2px rgba(0,0,0,.15);
+    transition: background-color .2s ease;
+  }
+  .sw::after {
+    content: ""; position: absolute; top: 3px; left: 3px;
+    width: 23px; height: 23px; border-radius: 50%;
+    background: #FFFDF6; box-shadow: 0 1px 4px rgba(0,0,0,.22);
+    transition: transform .2s ease;
+  }
+  .sw.on { background: var(--wine); }
+  .sw.on::after { transform: translateX(21px); }
+  .sw.busy { opacity: .6; }
+  .sw:disabled { opacity: .35; }
+  .lights-note { margin-top: 8px; text-align: center; font-size: 12.5px; color: var(--ink-soft); }
+  .lights-note:empty { display: none; }
+
+  /* Rename sheet */
+  .rename-body { padding: 4px 18px 18px; }
+  .rename-body label { display: block; font-size: 13px; color: var(--ink-soft); margin-bottom: 8px; }
+  .rename-body input {
+    width: 100%; box-sizing: border-box;
+    font: 600 20px/1.3 inherit; font-family: inherit;
+    padding: 12px 14px; border-radius: 14px;
+    border: 1px solid var(--line); background: var(--bg); color: var(--ink);
+    text-align: center;
+  }
+  .rename-body .hint { margin: 10px 0 14px; font-size: 12.5px; color: var(--ink-soft); text-align: center; }
+  .rename-body .row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .rename-body .row .secondary { padding: 14px 10px; }
+  .rename-body .row .primary   { padding: 14px 10px; font-size: 15px; box-shadow: none; }
 
   .grid {
     margin-top: 14px;
@@ -445,6 +504,9 @@
     }
     .secondary.confirm { background: #4A3A1A; border-color: #C9A85C; color: #F3DFB0; }
     .copy { background: #4A3A1A; border-color: #C9A85C; color: #F3DFB0; }
+    .light.on { background: #33281A; border-color: #6B5630; }
+    .sw { background: #4A4036; }
+    .sw::after { background: #EDE3D2; }
   }
 </style>
 </head>
@@ -462,10 +524,20 @@
     <button class="later" id="install-later" aria-label="Not now">&times;</button>
   </div>
 
-  <div class="primary-row">
-    <button class="primary on" id="btn-on">Lights On</button>
-    <button class="primary" id="btn-off">All Lights Off</button>
+  <div class="lights">
+    <div class="light" id="light-1">
+      <button class="name" id="name-1" title="Tap to rename">Light 1</button>
+      <button class="sw" id="sw-1" aria-label="Light 1" disabled></button>
+      <div class="mode" id="mode-1">&nbsp;</div>
+    </div>
+    <div class="light" id="light-2">
+      <button class="name" id="name-2" title="Tap to rename">Light 2</button>
+      <button class="sw" id="sw-2" aria-label="Light 2" disabled></button>
+      <div class="mode" id="mode-2">&nbsp;</div>
+    </div>
   </div>
+  <div class="lights-note" id="lights-note"></div>
+  <button class="primary wide" id="btn-off">All Lights Off</button>
 
   <div class="grid">
     <button class="secondary" id="btn-status">Check Status</button>
@@ -507,6 +579,20 @@
 </div>
 
 <div class="sheet-bg" id="sheet-bg"></div>
+<div class="sheet" id="rename-sheet" role="dialog" aria-label="Rename light">
+  <div class="sheet-head">
+    <h2>Rename this light<small>The panel, its alerts and this page all use the new name.</small></h2>
+    <button id="rename-close" aria-label="Close">&times;</button>
+  </div>
+  <div class="rename-body">
+    <input id="rename-input" type="text" maxlength="14" autocomplete="off" autocapitalize="words" spellcheck="false" placeholder="e.g. Porch Light">
+    <div class="hint">Up to 14 letters or numbers.</div>
+    <div class="row">
+      <button class="secondary" id="rename-cancel">Cancel</button>
+      <button class="primary" id="rename-save">Save</button>
+    </div>
+  </div>
+</div>
 <div class="sheet" id="sheet" role="dialog" aria-label="Recent alerts">
   <div class="sheet-head">
     <h2>Recent Alerts<small>Last 12 hours</small></h2>
@@ -763,11 +849,28 @@
     });
   }
 
-  // Ask the panel which firmware it runs. The panel answers on <topic>-ver
-  // (which no phone subscribes to) at most once every 20 s, so an answer it
-  // gave in the last 25 s is accepted too -- otherwise a quick reload would
-  // look like a dead panel.
-  var verInFlight = null;
+  // Ask the panel which firmware it runs and how its lights stand. The panel
+  // answers on <topic>-ver (which no phone subscribes to) with one line:
+  //   5.7.0|Ceiling Glow=1,auto|Wall Accent=0
+  // or, from firmware before 5.7, just the version. Replies are rate-limited
+  // on the panel, so one it gave in the last 25 s is accepted too -- otherwise
+  // a quick reload would look like a dead panel.
+  function parseState(text) {
+    var m = /^(\d+\.\d+\.\d+)(?:\|(.*))?$/.exec(text);
+    if (!m) return null;
+    var st = { version: m[1], lights: null };
+    if (m[2]) {
+      var parts = m[2].split("|"), lights = [];
+      for (var i = 0; i < parts.length; i++) {
+        var p = /^(.*)=([01])(?:,(\w+))?$/.exec(parts[i]);
+        if (!p) return null;
+        lights.push({ name: p[1], on: p[2] === "1", tag: p[3] || "" });
+      }
+      if (lights.length === 2) st.lights = lights;
+    }
+    return st;
+  }
+  var verInFlight = null, lastState = null;
   function askVersion(timeoutMs) {
     if (verInFlight) return verInFlight;
     var since = nowSec() - 25;
@@ -776,9 +879,9 @@
     verInFlight = new Promise(function (resolve) {
       (function poll() {
         pollTopic(VER_URL, since).then(function (list) {
-          var found = "";
-          list.forEach(function (m) { if (/^\d+\.\d+\.\d+$/.test(m.message)) found = m.message; });
-          if (found) return resolve(found);
+          var found = null;
+          list.forEach(function (m) { var st = parseState(m.message); if (st) found = st; });
+          if (found) { lastState = found; lights.apply(found); return resolve(found.version); }
           if (Date.now() < deadline) setTimeout(poll, 1500); else resolve("");
         });
       })();
@@ -793,8 +896,8 @@
   function tick(btn, label) {
     try { if (navigator.vibrate) navigator.vibrate(18); } catch (e) { /* ignore */ }
     btn.classList.add("sent");
-    btn.textContent = "\u2713  " + label;
-    setTimeout(function () { btn.classList.remove("sent"); btn.textContent = label; }, 1100);
+    if (label) btn.textContent = "\u2713  " + label;
+    setTimeout(function () { btn.classList.remove("sent"); if (label) btn.textContent = label; }, 1100);
   }
 
   // ---- Sending -----------------------------------------------------------
@@ -826,6 +929,7 @@
             tick(btn, restore);
             link.online();
             if (/^Restarting/.test(reply)) setTimeout(function () { link.check(); }, 35000);
+            else lights.refresh();
           } else {
             say("Sent, but no confirmation yet — the panel may be reconnecting. It will catch up on its own.", true, 9000);
             link.check();
@@ -845,10 +949,6 @@
     var armed = false;
 
     btn.addEventListener("click", function () {
-      if (cmd === "on" && link.running() && !link.atLeast("5.6.18")) {
-        say("Lights On needs panel update 5.6.18 \u2014 tap Update above.", true, 6000);
-        return;
-      }
       if (btn.dataset.confirm && !armed) {
         armed = true;
         btn.textContent = "Tap again to confirm";
@@ -867,10 +967,120 @@
     });
   }
 
-  wire("btn-on",      "on");
   wire("btn-off",     "off");
   wire("btn-status",  "status");
   wire("btn-restart", "restart");
+
+  // ---- Lights: named switches ---------------------------------------------
+  // The names and the on/off state come from the panel's state line (see
+  // askVersion). A switch is optimistic -- it flips at once, the command goes
+  // out, and the panel's confirmation settles it; no answer flips it back.
+  var lights = (function () {
+    var note = document.getElementById("lights-note");
+    var els = [1, 2].map(function (i) {
+      return {
+        box: document.getElementById("light-" + i), name: document.getElementById("name-" + i),
+        sw: document.getElementById("sw-" + i), mode: document.getElementById("mode-" + i), known: false
+      };
+    });
+    var names = ["Light 1", "Light 2"];
+
+    function esc(t) { return String(t).replace(/[&<>]/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]; }); }
+
+    function apply(st) {
+      if (!st.lights) {
+        // Older firmware: version only. Lights can't be switched one by one.
+        els.forEach(function (e) { e.sw.disabled = true; e.mode.textContent = "\u00a0"; });
+        note.textContent = "Switching lights one by one needs panel update 5.7 \u2014 tap Update below.";
+        return;
+      }
+      note.textContent = "";
+      st.lights.forEach(function (L, i) {
+        var e = els[i];
+        names[i] = L.name;
+        e.name.textContent = L.name;
+        e.sw.setAttribute("aria-label", L.name);
+        e.sw.disabled = false; e.known = true;
+        e.sw.classList.remove("busy");
+        e.sw.classList.toggle("on", L.on);
+        e.box.classList.toggle("on", L.on);
+        e.mode.textContent = L.tag === "auto" ? "Auto \u00b7 " + (L.on ? "on" : "off")
+                           : L.tag === "manual" ? (L.on ? "On until you switch it off" : "Off \u00b7 manual")
+                           : (L.on ? "On" : "Off");
+      });
+    }
+
+    // Re-read the state a moment after any command, so a change the panel
+    // made (or someone made at the panel) shows here.
+    var refreshTimer = null;
+    function refresh() {
+      clearTimeout(refreshTimer);
+      refreshTimer = setTimeout(function () { askVersion(10000); }, 1200);
+    }
+
+    els.forEach(function (e, i) {
+      e.sw.addEventListener("click", function () {
+        if (e.sw.disabled || e.sw.classList.contains("busy")) return;
+        var turnOn = !e.sw.classList.contains("on");
+        e.sw.classList.add("busy");
+        e.sw.classList.toggle("on", turnOn);
+        e.box.classList.toggle("on", turnOn);
+        e.mode.textContent = turnOn ? "Switching on\u2026" : "Switching off\u2026";
+        var since = nowSec() - 1, cmd = (turnOn ? "on " : "off ") + (i + 1);
+        fetch(CMD_URL, { method: "POST", body: cmd, mode: "no-cors" }).catch(function () {})
+          .then(function () { return waitReply(since, 18000); })
+          .then(function (reply) {
+            if (reply) { say(reply, false, 7000); tick(e.sw, ""); link.online(); refresh(); }
+            else {
+              say("No confirmation from the panel \u2014 it may be reconnecting.", true, 8000);
+              if (lastState) apply(lastState);   // back to what we last knew
+              link.check();
+            }
+          });
+      });
+    });
+
+    // ---- Rename ----
+    var sheet = document.getElementById("rename-sheet"), bg = document.getElementById("sheet-bg");
+    var input = document.getElementById("rename-input"), which = 0;
+    function open(i) {
+      if (!els[i].known) { say("Renaming needs panel update 5.7.", true, 5000); return; }
+      which = i;
+      input.value = names[i];
+      sheet.classList.add("open"); bg.classList.add("open");
+      setTimeout(function () { input.focus(); input.select(); }, 250);
+    }
+    function close() { sheet.classList.remove("open"); bg.classList.remove("open"); input.blur(); }
+    function save() {
+      var v = input.value.replace(/[^\x20-\x7E]/g, "").replace(/[|=,]/g, "").replace(/\s+/g, " ").trim().slice(0, 14);
+      if (!v) { input.focus(); return; }
+      if (v === names[which]) { close(); return; }
+      close();
+      var e = els[which];
+      e.name.textContent = v;
+      say("Renaming\u2026");
+      var since = nowSec() - 1;
+      fetch(CMD_URL, { method: "POST", body: "name " + (which + 1) + " " + v, mode: "no-cors" }).catch(function () {})
+        .then(function () { return waitReply(since, 18000, function (t) { return /^Renamed to|^That name/.test(t); }); })
+        .then(function (reply) {
+          if (/^Renamed/.test(reply)) { say(reply, false, 6000); tick(e.sw, ""); refresh(); }
+          else { say(reply || "No confirmation from the panel. The name was not changed.", true, 8000); e.name.textContent = names[which]; }
+        });
+    }
+    els.forEach(function (e, i) { e.name.addEventListener("click", function () { open(i); }); });
+    document.getElementById("rename-close").addEventListener("click", close);
+    document.getElementById("rename-cancel").addEventListener("click", close);
+    document.getElementById("rename-save").addEventListener("click", save);
+    input.addEventListener("keydown", function (ev) { if (ev.key === "Enter") { ev.preventDefault(); save(); } });
+    bg.addEventListener("click", close);
+
+    // While the page is open, look again every 30 s so a tap on the panel
+    // itself shows here within half a minute. Nothing while hidden.
+    setInterval(function () { if (!document.hidden && lastState && lastState.lights) askVersion(10000); }, 30000);
+    document.addEventListener("visibilitychange", function () { if (!document.hidden && lastState) askVersion(10000); });
+
+    return { apply: apply, refresh: refresh };
+  })();
 
   // ---- Link check, update offer, update progress ---------------------------
   // On open the panel is asked for its version. If it answers, the published
