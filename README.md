@@ -47,7 +47,7 @@ Panel replaces a conventional switchboard anywhere in a home — front door, liv
 ### In the pocket
 
 - **One static web page** — no app store, no backend, no sign-up
-- **Lights On / Off** from anywhere in the world
+- **Each light by name** — switch it, see its state, rename it — from anywhere
 - **Status, restart and recent alerts** on demand
 - **One-tap firmware updates** — the panel downloads, verifies and installs itself
 - **Set up in two minutes** by scanning a QR code on the panel
@@ -83,7 +83,7 @@ flowchart LR
 |---|---|---|
 | `<topic>` | Panel → phones | Doorbell and motion alerts; command confirmations |
 | `<topic>-cmd` | Phones → panel | The command channel the buttons publish to |
-| `<topic>-ver` | Panel → phones | Silent version replies, used by the Update row |
+| `<topic>-ver` | Panel → phones | Silent state line (`version|name=1,auto|name=0`) for the switches and the Update row |
 
 The panel executes a strict whitelist of commands and acknowledges each on `<topic>`, so a household subscribes to **one** topic and sees alerts and confirmations in the same stream.
 
@@ -99,8 +99,9 @@ The panel executes a strict whitelist of commands and acknowledges each on `<top
 
 | Control | What it does |
 |---|---|
-| **Lights On** | Starts a manual-on session, like tapping the tile on the panel |
-| **All Lights Off** | Switches everything off and hands control back to motion automation |
+| **Two named switches** | One per light, showing its real name and current state; the motion light is tagged *Auto* or *Manual*. Switching the motion light on starts a manual session, off hands it back to the sensor |
+| **Tap a name to rename** | The panel's tiles, its notifications and this page all use the new name |
+| **All Lights Off** | Everything off, motion automation back in charge |
 | **Check Status** | The panel replies with its state: lights, link, uptime |
 | **Recent Alerts** | Bottom sheet with the last 12 hours of notifications |
 | **Restart Panel** | Confirm-twice, then a clean reboot |
@@ -111,7 +112,7 @@ The panel executes a strict whitelist of commands and acknowledges each on `<top
 
 **Designed to stay calm**
 
-- Two large primary buttons for the daily action; everything else is secondary
+- The two lights are the hero; everything else is secondary
 - Destructive actions need a second tap
 - Honest feedback: *Sending…* → gold tick when the **panel itself** confirms
 - Warm cream and burgundy, matching the on-device UI
@@ -202,7 +203,7 @@ The relay is a public service: anyone who knows a topic name can subscribe or pu
 
 **Generation.** The firmware mints topics from the ESP32's hardware RNG as `word-word-xxxx` — two words from curated 64-entry lists plus a four-character suffix from a 31-symbol alphabet with no look-alike characters. That is 64 × 64 × 31⁴ ≈ **3.8 × 10⁹** combinations. Users never choose topics, which removes the dictionary-word and reuse failures of user-chosen names.
 
-**What a leaked topic allows.** Reading the panel's notifications, and sending the whitelisted commands: lights on or off, a status report, a restart, checking for and installing the **published** firmware, and opening a firmware-upload window that is reachable **only on the home network** for five minutes. No command unlocks anything, reads stored data or exposes credentials. Commands are ignored during a firmware write, and messages older than 90 seconds are never executed, so a queued command cannot replay after a reboot.
+**What a leaked topic allows.** Reading the panel's notifications, and sending the whitelisted commands: a light on or off, renaming a light, a status report, a restart, checking for and installing the **published** firmware, and opening a firmware-upload window that is reachable **only on the home network** for five minutes. No command unlocks anything, reads stored data or exposes credentials. Commands are ignored during a firmware write, and messages older than 90 seconds are never executed, so a queued command cannot replay after a reboot.
 
 **What this page cannot do.** It cannot read notifications, cannot discover topics, and cannot reach a panel except through the relay. If the page's host disappeared, the buttons would stop — the panel, its automation and its notifications would not.
 

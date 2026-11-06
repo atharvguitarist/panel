@@ -179,7 +179,7 @@ const char* PHONE_UI_BASE_URL = "https://atharvguitarist.github.io/panel/";
 // straight out of the uploaded .bin -- change ONLY the number. FW_VERSION
 // points past the tag, so every existing use is unchanged, and because it is
 // used everywhere the linker can never strip the tag from the binary.
-const char  FW_VERSION_TAG[] = "PANELFW:5.6.20";
+const char  FW_VERSION_TAG[] = "PANELFW:5.7.0";
 const char* FW_VERSION = FW_VERSION_TAG + 8;
 const char* FW_MANIFEST_PATH = "firmware/manifest.json";
 const char* FW_BINARY_PATH   = "firmware/latest.bin";
@@ -219,7 +219,7 @@ const unsigned long AUTO_MANUAL_ON_FESTIVAL_INTERVAL_MS = 21600000UL; // 6 hours
 // don't disturb sleep, then resume normally once the window ends.
 // Default is midnight -> 7 AM; change AUTO_REMINDER_QUIET_END_HOUR if you'd
 // like a different wake-up cutoff.
-const int AUTO_REMINDER_QUIET_START_HOUR = 0; // 00:00 (midnight)
+const int AUTO_REMINDER_QUIET_START_HOUR = 23; // 23:00
 const int AUTO_REMINDER_QUIET_END_HOUR   = 7; // 07:00
 
 // Activity log file on the SD card (timestamp,event,detail per line).
@@ -384,6 +384,12 @@ enum AutoLightTarget {
   AUTO_TARGET_PANEL
 };
 
+// Light names: shown on the tiles, in Settings, in notifications and on the
+// phone page. Renamed from the phone ("name 1 Porch Light"); kept in NVS.
+// 14 characters fits the tile label (205px at FONT_26) and the Settings value.
+const size_t LIGHT_NAME_MAX = 14;
+char lightName1[LIGHT_NAME_MAX + 1] = "Ceiling Glow";   // output 1: ceiling relay
+char lightName2[LIGHT_NAME_MAX + 1] = "Wall Accent";    // output 2: wall / panel relay
 AutoLightTarget autoLightTarget = AUTO_TARGET_CEILING; // "Motion controls" — Settings > Motion, persisted in NVS
 
 bool doorbellActive = false;
@@ -871,6 +877,11 @@ String nvsGeoLon = "";
 void loadSavedSettings() {
   prefs.begin("doorpanel", false);
 
+  prefs.getString("name1", lightName1, sizeof(lightName1));
+  prefs.getString("name2", lightName2, sizeof(lightName2));
+  if (!lightName1[0]) strncpy(lightName1, "Ceiling Glow", sizeof(lightName1) - 1);
+  if (!lightName2[0]) strncpy(lightName2, "Wall Accent",  sizeof(lightName2) - 1);
+
   brightnessLevel = prefs.getUChar("brightness", 5); // default Level 6/7
   if (brightnessLevel > 6) {
     brightnessLevel = 5;
@@ -1122,7 +1133,7 @@ uint32_t getRecoveryCode() {
   return h % 1000000UL; // 6 digits, 000000-999999
 }
 
-#define PRINT_RECOVERY_CODE_ON_BOOT 1 // set to 0 once the label has been printed and stuck inside the unit
+#define PRINT_RECOVERY_CODE_ON_BOOT 0 // set to 0 once the label has been printed and stuck inside the unit
 
 // ---- PIN pad / recovery gesture state ----
 // The admin hotspot (top-left, 54x54) opens the PIN pad on a normal
@@ -3580,7 +3591,7 @@ lv_obj_t *createTile(lv_obj_t *parent, int x, int y, int w, int h, lv_event_cb_t
 
 void updateCeilingUI() {
   if (ceilingLabel) {
-    lv_label_set_text(ceilingLabel, "Ceiling Glow");
+    lv_label_set_text(ceilingLabel, lightName1);
   }
 
   if (ceilingTile) {
@@ -3669,7 +3680,7 @@ void updatePanelUI() {
   }
 
   if (panelLabel) {
-    lv_label_set_text(panelLabel, "Wall Accent");
+    lv_label_set_text(panelLabel, lightName2);
   }
 
   if (panelModeBadge) {
@@ -4467,12 +4478,12 @@ static int doNtfyClear(const char *seq, int timeoutMs) {
   HTTPClient http;
   http.setConnectTimeout(timeoutMs);
   http.setTimeout(timeoutMs);
-  char sid[96];
+  char sid[96], url[200];
   ntfySeqId(seq, sid, sizeof(sid));
-  String url = String("https://ntfy.sh/") +
-               (nvsNtfyTopic.length() > 0 ? nvsNtfyTopic : String(NTFY_TOPIC)) + "/" + sid + "/clear";
+  snprintf(url, sizeof(url), "https://ntfy.sh/%s/%s/clear",
+           nvsNtfyTopic.length() > 0 ? nvsNtfyTopic.c_str() : NTFY_TOPIC, sid);
   if (!http.begin(client, url)) return -101;
-  int code = http.PUT(String(""));
+  int code = http.PUT((uint8_t *)"", 0);
   http.end();
   return code;
 }
@@ -4681,11 +4692,15 @@ enum RemoteCommand : uint8_t {
   RCMD_STATUS,
   RCMD_HELP,
   RCMD_UPGRADE,
-  RCMD_VERSION,   // silent: the phone page asking which firmware is running
+  RCMD_VERSION,   // silent: the phone page asking for version + light state
+  RCMD_LIGHT_ON_1, RCMD_LIGHT_OFF_1,   // one light by number (1 = ceiling relay,
+  RCMD_LIGHT_ON_2, RCMD_LIGHT_OFF_2,   //                      2 = wall relay)
+  RCMD_NAME,      // "name 1 Porch Light": rename a light (text in pendingRemoteArg)
   RCMD_UNKNOWN
 };
 
 static volatile uint8_t pendingRemoteCommand = RCMD_NONE;
+static char pendingRemoteArg[LIGHT_NAME_MAX + 4] = "";   // written before pendingRemoteCommand, read after
 static TaskHandle_t     remoteTaskHandle = nullptr;
 static unsigned long pendingRemoteRestartAt = 0; // nonzero = restart scheduled
 
@@ -4753,8 +4768,26 @@ static void remoteHandleStreamLine(const char *line, time_t minTime) {
   }
   cmd[j] = '\0';
 
+  // "name <1|2> <text>" keeps the text's own capitalisation.
+  if ((cmd[0] == 'n' && strncmp(cmd, "name ", 5) == 0) && (cmd[5] == '1' || cmd[5] == '2') && cmd[6] == ' ') {
+    const char *t = msg + 7;
+    while (*t == ' ') t++;
+    size_t n = strlen(t);
+    while (n && t[n - 1] == ' ') n--;
+    if (n > LIGHT_NAME_MAX) n = LIGHT_NAME_MAX;
+    pendingRemoteArg[0] = cmd[5];
+    memcpy(pendingRemoteArg + 1, t, n);
+    pendingRemoteArg[n + 1] = '\0';
+    pendingRemoteCommand = RCMD_NAME;
+    return;
+  }
+
   // Exact matches, checked first: the phone page sends these.
-  if      (strcmp(cmd, "ver") == 0 || strcmp(cmd, "version") == 0) pendingRemoteCommand = RCMD_VERSION;
+  if      (strcmp(cmd, "ver") == 0 || strcmp(cmd, "version") == 0 || strcmp(cmd, "state") == 0) pendingRemoteCommand = RCMD_VERSION;
+  else if (strcmp(cmd, "on 1") == 0)  pendingRemoteCommand = RCMD_LIGHT_ON_1;
+  else if (strcmp(cmd, "off 1") == 0) pendingRemoteCommand = RCMD_LIGHT_OFF_1;
+  else if (strcmp(cmd, "on 2") == 0)  pendingRemoteCommand = RCMD_LIGHT_ON_2;
+  else if (strcmp(cmd, "off 2") == 0) pendingRemoteCommand = RCMD_LIGHT_OFF_2;
   else if (strcmp(cmd, "on") == 0 || strcmp(cmd, "lights on") == 0) pendingRemoteCommand = RCMD_LIGHTS_ON;
   else if (strstr(cmd, "help"))                          pendingRemoteCommand = RCMD_HELP;
   else if (strstr(cmd, "upgrade") || strstr(cmd, "install")) pendingRemoteCommand = RCMD_UPGRADE;
@@ -4785,20 +4818,33 @@ static void remotePollOnce(const char *topic) {
   HTTPClient http;
   http.setConnectTimeout(8000);
   http.setTimeout(8000);
+  http.setReuse(false);                      // Connection: close -- the body ends when the relay hangs up
   if (http.begin(client, url)) {
     int code = http.GET();
     if (code == 200) {
-      String body = http.getString();
-      int start = 0;
-      while (start < (int)body.length()) {
-        int nl = body.indexOf('\n', start);
-        if (nl < 0) nl = body.length();
-        if (nl - start > 1 && nl - start < 1000) {
-          String line = body.substring(start, nl);
-          remoteHandleStreamLine(line.c_str(), now - 90);
-          if (pendingRemoteCommand != RCMD_NONE) { vTaskDelay(pdMS_TO_TICKS(300)); }  // let loop() take it before the next
+      // Line by line off the socket into a fixed buffer: no String, no
+      // whole-body copy on the heap every 30 s.
+      static char line[1024];
+      size_t len = 0;
+      WiFiClient *st = http.getStreamPtr();
+      int remaining = http.getSize();            // -1 when the relay did not say
+      unsigned long lastByteAt = millis();
+      while (remaining != 0 && http.connected() && millis() - lastByteAt < 3000UL) {
+        int ci = st->read();
+        if (ci < 0) { vTaskDelay(pdMS_TO_TICKS(10)); continue; }
+        if (remaining > 0) remaining--;
+        lastByteAt = millis();
+        char ch = (char)ci;
+        if (ch == '\n') {
+          line[len] = '\0';
+          if (len > 1) {
+            remoteHandleStreamLine(line, now - 90);
+            if (pendingRemoteCommand != RCMD_NONE) { vTaskDelay(pdMS_TO_TICKS(300)); }  // let loop() take it before the next
+          }
+          len = 0;
+        } else if (ch != '\r' && len < sizeof(line) - 1) {
+          line[len++] = ch;
         }
-        start = nl + 1;
       }
     }
     http.end();
@@ -4824,7 +4870,7 @@ static void remoteControlTask(void *param) {
   (void)param;
   char topic[80];
   static char lineBuf[1024];
-  unsigned long backoffMs = 5000;   // doubles on repeated failures, capped at 5 min
+  unsigned long backoffMs = 5000;   // doubles on repeated failures, capped at 2 min
 
   for (;;) {
     remoteCommandTopic(topic, sizeof(topic));
@@ -4861,7 +4907,7 @@ static void remoteControlTask(void *param) {
     }
     if (!client.connect("ntfy.sh", 443)) {
       remoteIdleWait(backoffMs, topic);
-      if (backoffMs < 300000UL) backoffMs *= 2;
+      if (backoffMs < 120000UL) backoffMs *= 2;
       continue;
     }
 
@@ -4882,7 +4928,7 @@ static void remoteControlTask(void *param) {
         client.stop();
         remoteLinkState = 1;
         remoteIdleWait(backoffMs, topic);
-        if (backoffMs < 300000UL) backoffMs *= 2;
+        if (backoffMs < 120000UL) backoffMs *= 2;
         continue;
       }
     }
@@ -5614,6 +5660,96 @@ static void processFirmwareUpdateResults() {
   }
 }
 
+// ---- One light by number, from the phone ----
+// 1 = ceiling relay, 2 = wall relay. Whichever of the two is the motion light
+// gets the same treatment a tile tap gives it: ON starts a manual session,
+// OFF ends it and hands control back to the motion sensor. The other light
+// is a plain switch.
+static void remoteSetLight(uint8_t which, bool on) {
+  bool isMotionLight = (which == 1) == (autoLightTarget == AUTO_TARGET_CEILING);
+  if (isMotionLight) {
+    if (on) {
+      autoMode = AUTO_MODE_MANUAL_ON;
+      autoManualStartedAt = millis();
+      autoManualOffStartedAt = 0;
+      applyAutoOutput(true);
+    } else {
+      autoMode = AUTO_MODE_AUTO;
+      autoManualStartedAt = 0;
+      autoManualOffStartedAt = 0;
+      clearMotionAutoHold();
+      motionRearmAfterManualOffClear = true;
+      applyAutoOutput(false);
+    }
+    updateAutoLightUI();
+  } else if (which == 1) {
+    ceilingState = on;
+    pcfSetPin(PCF_CEILING_PIN, on);
+    updateCeilingUI();
+  } else {
+    panelOutputState = on;
+    pcfSetPin(PCF_PANEL_PIN, on);
+    updatePanelUI();
+  }
+  const char *nm = (which == 1) ? lightName1 : lightName2;
+  char d[64];
+  snprintf(d, sizeof(d), "%s switched %s remotely", nm, on ? "on" : "off");
+  logActivityEvent("REMOTE", d);
+  updateStatus(on ? "Status: Light ON (remote)" : "Status: Light OFF (remote)");
+  if (isMotionLight && on)       snprintf(d, sizeof(d), "%s on. Stays on until switched off, or sunrise.", nm);
+  else if (isMotionLight)        snprintf(d, sizeof(d), "%s off. Motion sensing is back in charge.", nm);
+  else                           snprintf(d, sizeof(d), "%s %s.", nm, on ? "on" : "off");
+  sendRemoteReply(d);
+}
+
+// ---- Version + light state for the phone page ----
+// One line on "<topic>-ver" (no phone subscribes to it, so no notification):
+//   5.7.0|Ceiling Glow=1,auto|Wall Accent=0
+// Each light: name=0/1, and for the motion light a tag: ",auto" (sensor in
+// charge) or ",manual" (a manual session, on or off). Sent when the page asks
+// and after every change the phone makes, at most once every 3 s.
+static void queueStateReply() {
+  static unsigned long lastAt = 0;
+  if (lastAt != 0 && millis() - lastAt < 3000UL) return;
+  if (WiFi.status() != WL_CONNECTED) return;
+  lastAt = millis();
+  const char *tag = (autoMode == AUTO_MODE_AUTO) ? ",auto" : ",manual";
+  bool c = (autoLightTarget == AUTO_TARGET_CEILING);
+  PushNotificationParams *p = new PushNotificationParams();   // zero-initialised
+  strncpy(p->suffix, "-ver", sizeof(p->suffix) - 1);
+  snprintf(p->message, sizeof(p->message), "%s|%s=%d%s|%s=%d%s",
+           FW_VERSION, lightName1, ceilingState ? 1 : 0, c ? tag : "",
+           lightName2, panelOutputState ? 1 : 0, c ? "" : tag);
+  strncpy(p->priority, "min", sizeof(p->priority) - 1);
+  enqueuePush(p);
+}
+
+// ---- Rename a light ----
+// Printable ASCII only (that is what the tile font carries), none of the
+// characters the state line uses as separators, 1..14 characters.
+static bool remoteRenameLight(uint8_t which, const char *text) {
+  char clean[LIGHT_NAME_MAX + 1];
+  size_t n = 0;
+  for (size_t i = 0; text[i] && n < LIGHT_NAME_MAX; i++) {
+    char ch = text[i];
+    if (ch < 0x20 || ch > 0x7E || ch == '|' || ch == '=' || ch == ',') continue;
+    if (ch == ' ' && (n == 0 || clean[n - 1] == ' ')) continue;   // no leading / double spaces
+    clean[n++] = ch;
+  }
+  while (n && clean[n - 1] == ' ') n--;
+  clean[n] = '\0';
+  if (n == 0) return false;
+  char *dst = (which == 1) ? lightName1 : lightName2;
+  strncpy(dst, clean, LIGHT_NAME_MAX); dst[LIGHT_NAME_MAX] = '\0';
+  prefs.begin("doorpanel", false);
+  prefs.putString(which == 1 ? "name1" : "name2", dst);
+  prefs.end();
+  updateCeilingUI();
+  updatePanelUI();
+  refreshAutoTargetLabel();
+  return true;
+}
+
 // Runs on the LVGL THREAD (loop). All UI / light-state work happens here.
 static void processRemoteCommand() {
   // Scheduled restart: fires a beat after the ack reply was dispatched so
@@ -5662,6 +5798,7 @@ static void processRemoteCommand() {
       updateStatus("Status: Lights OFF (remote)");
       logActivityEvent("REMOTE", "Lights switched off remotely");
       sendRemoteReply("Lights off. Motion sensing is back in charge.");
+      queueStateReply();
       break;
     }
 
@@ -5687,6 +5824,27 @@ static void processRemoteCommand() {
       updateStatus("Status: Lights ON (remote)");
       logActivityEvent("REMOTE", "Lights switched on remotely");
       sendRemoteReply("Lights on. They stay on until you say otherwise, or sunrise.");
+      queueStateReply();
+      break;
+    }
+
+    case RCMD_LIGHT_ON_1:  remoteSetLight(1, true);  queueStateReply(); break;
+    case RCMD_LIGHT_OFF_1: remoteSetLight(1, false); queueStateReply(); break;
+    case RCMD_LIGHT_ON_2:  remoteSetLight(2, true);  queueStateReply(); break;
+    case RCMD_LIGHT_OFF_2: remoteSetLight(2, false); queueStateReply(); break;
+
+    case RCMD_NAME: {
+      uint8_t which = (pendingRemoteArg[0] == '2') ? 2 : 1;
+      char msg[64];
+      if (remoteRenameLight(which, pendingRemoteArg + 1)) {
+        snprintf(msg, sizeof(msg), "Light %u renamed to %s", which, which == 1 ? lightName1 : lightName2);
+        logActivityEvent("REMOTE", msg);
+        snprintf(msg, sizeof(msg), "Renamed to %s.", which == 1 ? lightName1 : lightName2);
+      } else {
+        snprintf(msg, sizeof(msg), "That name won't work. Use 1 to 14 letters or numbers.");
+      }
+      sendRemoteReply(msg);
+      queueStateReply();
       break;
     }
 
@@ -5715,11 +5873,11 @@ static void processRemoteCommand() {
       int rssi = WiFi.status() == WL_CONNECTED ? (int)WiFi.RSSI() : 0;
       const char *wifi = rssi == 0 ? "off" : rssi >= -65 ? "strong" : rssi >= -75 ? "good" : "weak";
       if (upMin >= 60)
-        snprintf(msg, sizeof(msg), "All good. v%s, up %lu h %lu min, Wi-Fi %s. Ceiling %s, wall light %s.",
-                 FW_VERSION, upMin / 60, upMin % 60, wifi, ceilingState ? "on" : "off", panelOutputState ? "on" : "off");
+        snprintf(msg, sizeof(msg), "All good. v%s, up %lu h %lu min, Wi-Fi %s. %s %s, %s %s.",
+                 FW_VERSION, upMin / 60, upMin % 60, wifi, lightName1, ceilingState ? "on" : "off", lightName2, panelOutputState ? "on" : "off");
       else
-        snprintf(msg, sizeof(msg), "All good. v%s, up %lu min, Wi-Fi %s. Ceiling %s, wall light %s.",
-                 FW_VERSION, upMin, wifi, ceilingState ? "on" : "off", panelOutputState ? "on" : "off");
+        snprintf(msg, sizeof(msg), "All good. v%s, up %lu min, Wi-Fi %s. %s %s, %s %s.",
+                 FW_VERSION, upMin, wifi, lightName1, ceilingState ? "on" : "off", lightName2, panelOutputState ? "on" : "off");
       sendRemoteReply(msg);
       break;
     }
@@ -5728,26 +5886,16 @@ static void processRemoteCommand() {
       startFirmwareUpgrade();
       break;
 
-    case RCMD_VERSION: {
-      // Answered on "<topic>-ver", which no phone subscribes to: the page
-      // reads it, nobody gets a notification. At most once per 20s, so a
-      // page left reloading can never keep the panel busy with TLS.
-      static unsigned long lastVerReplyAt = 0;
-      if (lastVerReplyAt != 0 && millis() - lastVerReplyAt < 20000UL) break;
-      if (WiFi.status() != WL_CONNECTED) break;
-      lastVerReplyAt = millis();
-      PushNotificationParams *p = new PushNotificationParams();   // zero-initialised
-      strncpy(p->suffix, "-ver", sizeof(p->suffix) - 1);
-      strncpy(p->message, FW_VERSION, sizeof(p->message) - 1);
-      strncpy(p->priority, "min", sizeof(p->priority) - 1);
-      enqueuePush(p);
+    case RCMD_VERSION:
+      queueStateReply();
       break;
-    }
 
     case RCMD_HELP: {
       sendRemoteReply(
         "Send me a word:\n"
-        "on / off = lights\n"
+        "on / off = all lights\n"
+        "on 1, off 2 = one light by number\n"
+        "name 1 Porch Light = rename a light\n"
         "status = how I'm doing\n"
         "restart = reboot\n"
         "upgrade = install the latest firmware\n"
@@ -5804,9 +5952,18 @@ void updateAutoLightManualOnReminder() {
   // reminders to fire all at once once the window ends.
   lastAutoManualOnReminderAt = millis();
 
-  if (isAutoReminderQuietHoursNow()) return;
+  // During a festival the light is meant to stay on: one word at 6 hours,
+  // then silence until the light is switched off and on again.
+  static unsigned long remindedSessionStart = 0;
+  if (activeFestivalTheme && remindedSessionStart == autoManualStartedAt) return;
 
-  const char *lightName = (autoLightTarget == AUTO_TARGET_CEILING) ? "Ceiling Light" : "Wall Light";
+  // At night only when somebody is evidently up and about: motion in the
+  // last 15 minutes. Otherwise the light stays on and the household sleeps.
+  bool someoneAbout = motionStableState || (motionClearedAt != 0 && millis() - motionClearedAt < 15UL * 60UL * 1000UL);
+  if (isAutoReminderQuietHoursNow() && !someoneAbout) return;
+  remindedSessionStart = autoManualStartedAt;
+
+  const char *lightName = (autoLightTarget == AUTO_TARGET_CEILING) ? lightName1 : lightName2;
   char message[120];
   int hrs = (int)(onForMs / 3600000UL);
   snprintf(message, sizeof(message), "Still on after %d hour%s. Left on by mistake?", hrs, hrs == 1 ? "" : "s");
@@ -6072,26 +6229,8 @@ void checkWelcomeOverlayTrigger() {
       // One silent card that counts up ("3 times since 6:10 pm") instead of
       // a new card per event; a quiet half hour starts a fresh count and the
       // old card dismisses itself.
-      static unsigned long burstStartedAt = 0, lastAt = 0;
-      static int count = 0;
-      static char sinceText[16] = "";
-      if (lastAt == 0 || millis() - lastAt > 30UL * 60UL * 1000UL) {
-        count = 0; burstStartedAt = millis();
-        sinceText[0] = '\0';
-        if (isTimeReadyFast()) {
-          struct tm t; getLocalTmFast(&t);
-          int h12 = t.tm_hour % 12; if (h12 == 0) h12 = 12;
-          snprintf(sinceText, sizeof(sinceText), "%d:%02d %s", h12, t.tm_min, t.tm_hour < 12 ? "am" : "pm");
-        }
-      }
-      lastAt = millis();
-      count++;
-      char msg[96];
-      if (count == 1)           snprintf(msg, sizeof(msg), "Movement outside.");
-      else if (sinceText[0])    snprintf(msg, sizeof(msg), "Movement outside, %d times since %s.", count, sinceText);
-      else                      snprintf(msg, sizeof(msg), "Movement outside, %d times.", count);
-      (void)burstStartedAt;
-      sendPushNotificationEx("Front Porch", msg, "low", "motion", 30UL * 60UL * 1000UL);
+      // One card, replaced on every new detection, gone after 30 quiet minutes.
+      sendPushNotificationEx("Front Porch", "Motion detected.", "low", "motion", 30UL * 60UL * 1000UL);
     }
 
     // Only greet on the main dashboard (skip diagnostics/admin/portal screens).
@@ -6267,7 +6406,7 @@ void createMainUI() {
   }
 
   ceilingLabel = lv_label_create(ceilingTile);
-  lv_label_set_text(ceilingLabel, "Ceiling Glow");
+  lv_label_set_text(ceilingLabel, lightName1);
   lv_obj_set_style_text_color(ceilingLabel, lv_color_hex(0x1B0505), 0);
   lv_obj_set_style_text_font(ceilingLabel, FONT_26, 0);
   lv_obj_set_width(ceilingLabel, 205);
@@ -6331,7 +6470,7 @@ void createMainUI() {
   }
 
   panelLabel = lv_label_create(panelTile);
-  lv_label_set_text(panelLabel, "Wall Accent");
+  lv_label_set_text(panelLabel, lightName2);
   lv_obj_set_style_text_color(panelLabel, lv_color_hex(0x1B0505), 0);
   lv_obj_set_style_text_font(panelLabel, FONT_26, 0);
   lv_obj_set_width(panelLabel, 205);
@@ -7086,7 +7225,7 @@ void refreshManualCooldownLabel() {
 
 void refreshAutoTargetLabel() {
   if (lblAutoTarget) {
-    lv_label_set_text(lblAutoTarget, autoLightTarget == AUTO_TARGET_CEILING ? "Ceiling" : "Panel");
+    lv_label_set_text(lblAutoTarget, autoLightTarget == AUTO_TARGET_CEILING ? lightName1 : lightName2);
   }
 }
 
@@ -9099,7 +9238,7 @@ void showSettingsScreen() {
     char buf[16];
     // Row 2 — Motion controls: which light motion detection drives (new)
     lblAutoTarget = createCycleRow(settingsPanels[TAB_MOTION], "Motion controls", 50, cycleAutoTargetCb,
-      autoLightTarget == AUTO_TARGET_CEILING ? "Ceiling" : "Panel");
+      autoLightTarget == AUTO_TARGET_CEILING ? lightName1 : lightName2);
 
     // Row 3 — Motion hold timer (shifted down 50px)
     formatSecondsLabel(buf, sizeof(buf), motionHoldTimeMs);
