@@ -9500,8 +9500,10 @@ void updateDiagnosticsIfVisible() {
 // =====================================================
 
 // ---- Crash recorder ----
-// Lives in crash_note.cpp (an extern "C" definition inside the .ino trips the
-// Arduino prototype generator). RTC slow memory survives a panic reset, so
+// Lives in crash_note.cpp. (Keep it there, and never write the C-linkage
+// keyword pair in this file, even in a comment: the Arduino prototype
+// generator scans the sketch text for it.) RTC slow memory survives a panic
+// reset, so
 // the next boot can write what the chip was doing when it died into the
 // activity log instead of Diagnostics saying only "Crash (panic)".
 // Boot: if the last reset was a recorded crash, put it in the log. The two
