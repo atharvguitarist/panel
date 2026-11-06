@@ -1,0 +1,83 @@
+name: Build and publish firmware
+
+# Push a new sketch/Panel/Panel.ino -> GitHub compiles it, reads the version
+# from the binary, writes firmware/latest.bin + manifest.json, commits them and
+# redeploys the page. The panel's phone page then offers the update.
+on:
+  push:
+    branches: [main]
+    paths: ["sketch/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+env:
+  # Tools menu in Arduino IDE: PSRAM = OPI PSRAM, Partition Scheme = Minimal SPIFFS.
+  FQBN: "esp32:esp32:esp32s3:PSRAM=opi,PartitionScheme=min_spiffs,FlashMode=qio"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read library versions
+        run: |
+          grep -E '^[A-Z0-9_]+=[0-9.]+$' sketch/versions.env >> "$GITHUB_ENV"
+
+      - name: Check the sketch folder is complete
+        run: |
+          test -f sketch/Panel/Panel.ino        || { echo "::error::sketch/Panel/Panel.ino is missing"; exit 1; }
+          test -f sketch/lv_conf.h              || { echo "::error::sketch/lv_conf.h is missing - copy it from d:\\sketchbook\\libraries"; exit 1; }
+          test -f sketch/libraries/figtree_fonts/library.properties || ls sketch/libraries/figtree_fonts/*.h >/dev/null 2>&1 \
+                                                || { echo "::error::sketch/libraries/figtree_fonts is empty - copy the folder from d:\\sketchbook\\libraries"; exit 1; }
+
+      - name: Install arduino-cli, ESP32 core and libraries
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | BINDIR=/usr/local/bin sh
+          arduino-cli config init
+          arduino-cli config add board_manager.additional_urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          arduino-cli core update-index
+          arduino-cli core install "esp32:esp32@${ESP32_CORE}"
+          arduino-cli lib install "lvgl@${LVGL_VER}" "LovyanGFX@${LOVYAN_VER}" "ArduinoJson@${ARDUINOJSON_VER}"
+          # lvgl looks for lv_conf.h in the folder that contains the lvgl folder
+          cp sketch/lv_conf.h "$HOME/Arduino/libraries/lv_conf.h"
+
+      - name: Compile
+        run: |
+          arduino-cli compile --fqbn "$FQBN" --libraries sketch/libraries \
+            --output-dir out sketch/Panel
+
+      - name: Size check (slot is 1,966,080 bytes)
+        run: |
+          ls -l out
+          SZ=$(stat -c %s out/Panel.ino.bin)
+          echo "app image: $SZ bytes"
+          [ "$SZ" -gt 800000 ] && [ "$SZ" -lt 1966080 ] || { echo "::error::image size $SZ is outside the expected range"; exit 1; }
+          cp out/Panel.ino.bin firmware/Panel.ino.bin
+
+      - name: Build manifest (version, size, md5 read from the binary)
+        id: pub
+        run: python3 -I tools/publish.py
+
+      - name: Commit
+        if: steps.pub.outputs.changed == 'true'
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A firmware
+          git commit -m "Build v${{ steps.pub.outputs.version }}"
+          git push
+
+      - name: Redeploy page
+        if: steps.pub.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X POST "repos/${{ github.repository }}/pages/builds" || echo "Pages will pick it up on its own"
