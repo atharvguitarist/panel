@@ -9526,7 +9526,10 @@ static inline void crashCopy(char *dst, const char *src, size_t n) {
   if (src) for (; i < n - 1 && src[i]; i++) dst[i] = src[i];
   dst[i] = '\0';
 }
-extern "C" void IRAM_ATTR __wrap_esp_panic_handler(PanelPanicInfo *info) {
+// No IRAM_ATTR here: the Arduino prototype generator cannot copy a signature
+// that carries a section attribute. A cache-disabled panic therefore leaves no
+// note (the chip still resets as before); every other kind does.
+extern "C" void __wrap_esp_panic_handler(PanelPanicInfo *info) {
   crashNote.magic = CRASH_NOTE_MAGIC;
   crashNote.core  = info->core;
   crashNote.pc    = (uint32_t)info->addr;
