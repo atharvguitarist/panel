@@ -178,7 +178,7 @@ const char* PHONE_UI_BASE_URL = "https://atharvguitarist.github.io/panel/";
 // straight out of the uploaded .bin -- change ONLY the number. FW_VERSION
 // points past the tag, so every existing use is unchanged, and because it is
 // used everywhere the linker can never strip the tag from the binary.
-const char  FW_VERSION_TAG[] = "PANELFW:5.6.17";
+const char  FW_VERSION_TAG[] = "PANELFW:5.6.18";
 const char* FW_VERSION = FW_VERSION_TAG + 8;
 const char* FW_MANIFEST_PATH = "firmware/manifest.json";
 const char* FW_BINARY_PATH   = "firmware/latest.bin";
@@ -454,7 +454,7 @@ void savePhoneSetupPending(bool pending);
 void showFirmwarePortalScreen(const char *message, const char *urlText, const char *hintText);
 void startFirmwareUpgrade();
 void startFirmwareUpdateCheck();
-int  doNtfyPublish(const char *suffix, const char *title, const char *message, const char *priority, const char *actions, int timeoutMs = 4000);
+int  doNtfyPublish(const char *suffix, const char *title, const char *message, const char *priority, const char *actions, int timeoutMs = 4000, const char *seq = nullptr, bool click = false);
 void updateWeatherIconDisplay(bool forceReload = false);
 void updateWeather();
 static void weatherTickerReset();
@@ -697,6 +697,16 @@ struct PushNotificationParams {
   char priority[12];
   char actions[160];   // optional ntfy "Actions" header -- buttons ON the notification
   char suffix[8];      // "" = main topic; "-ver" = silent version channel (nobody subscribes)
+  // Notification hygiene (ntfy sequence IDs, Android app >= 1.22.2):
+  //  seq      -- short key ("motion", "reply", ...). A later push with the same
+  //              key REPLACES the earlier card on the phone instead of adding
+  //              one. Empty = ordinary new card.
+  //  clearMs  -- if nonzero, the worker dismisses the card this many ms after
+  //              it was sent (PUT /<topic>/<seq>/clear). Needs seq.
+  //  click    -- tapping the card opens the phone control page.
+  char seq[24];
+  uint32_t clearMs;
+  bool click;
 };
 volatile bool    fwResultFromSilentCheck = false; // background check: no push, no screen
 char             fwCheckSummary[40] = "Not checked yet"; // shown on Diagnostics
@@ -3857,7 +3867,7 @@ void doorbellCb(lv_event_t *e) {
       snprintf(d, sizeof(d), "Storm guard: 5 presses in %lus, bell paused 2 min (touch rejects %u)",
                (now - oldest) / 1000UL, (unsigned)touchRejectCount);
       logActivityEvent("DOORBELL", d);
-      sendPushNotification("Doorbell", "Pressed repeatedly -- bell paused for 2 minutes.", "default");
+      sendPushNotificationEx("Doorbell", "Lots of ringing. Bell paused for 2 minutes.", "default", "bell-pause", 10UL * 60UL * 1000UL);
       updateStatus("Status: Doorbell paused (too many presses)");
       return;
     }
@@ -3876,7 +3886,7 @@ void doorbellCb(lv_event_t *e) {
   startBellRingAnimation();
 
   logActivityEvent("DOORBELL", "Button pressed");
-  sendPushNotification("Doorbell", "Someone is at the door", "default");
+  sendPushNotification("Doorbell", "Someone's at the door.", "high");
 
   updateStatus("Status: Doorbell ringing...");
 }
@@ -4409,6 +4419,7 @@ void logActivityEvent(const char *eventType, const char *detail) {
 // sendPushNotification() from earlier in the file (e.g. doorbellCb) fail
 // with "was not declared in this scope".
 void sendPushNotification(const char *title, const char *message, const char *priority = "default");
+void sendPushNotificationEx(const char *title, const char *message, const char *priority, const char *seq, uint32_t clearMs);
 
 // (struct PushNotificationParams is declared near the top of the file)
 
@@ -4427,7 +4438,40 @@ void sendPushNotification(const char *title, const char *message, const char *pr
 // explicitly asking "did that actually work?" and blocking for ~1-2s to
 // give a truthful answer is the right trade-off).
 int doPushNotificationRequest(const char *title, const char *message, const char *priority, const char *actions) {
-  return doNtfyPublish("", title, message, priority, actions, 2500);   // Send test: UI waits on this
+  return doNtfyPublish("", title, message, priority, actions, 2500, nullptr, false);   // Send test: UI waits on this
+}
+
+// The phone control page for THIS unit -- what a tapped notification opens.
+static void phonePageUrl(char *out, size_t n) {
+  const char *base = nvsPhoneUrl.length() > 0 ? nvsPhoneUrl.c_str() : PHONE_UI_BASE_URL;
+  const char *topic = nvsNtfyTopic.length() > 0 ? nvsNtfyTopic.c_str() : NTFY_TOPIC;
+  snprintf(out, n, "%s#t=%s", base, topic);
+}
+
+// Full sequence ID for a short key: prefixed with the topic so two panels
+// (or two apps) can never collide on "motion".
+static void ntfySeqId(const char *seq, char *out, size_t n) {
+  const char *topic = nvsNtfyTopic.length() > 0 ? nvsNtfyTopic.c_str() : NTFY_TOPIC;
+  snprintf(out, n, "%s-%s", topic, seq);
+}
+
+// Dismisses a card from every subscribed phone (ntfy "clear"). Best effort.
+static int doNtfyClear(const char *seq, int timeoutMs) {
+  if (WiFi.status() != WL_CONNECTED) return -100;
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setTimeout(timeoutMs);
+  HTTPClient http;
+  http.setConnectTimeout(timeoutMs);
+  http.setTimeout(timeoutMs);
+  char sid[96];
+  ntfySeqId(seq, sid, sizeof(sid));
+  String url = String("https://ntfy.sh/") +
+               (nvsNtfyTopic.length() > 0 ? nvsNtfyTopic : String(NTFY_TOPIC)) + "/" + sid + "/clear";
+  if (!http.begin(client, url)) return -101;
+  int code = http.PUT(String(""));
+  http.end();
+  return code;
 }
 
 // Same POST, to "<topic><suffix>". The suffix lets the panel answer the phone
@@ -4435,7 +4479,7 @@ int doPushNotificationRequest(const char *title, const char *message, const char
 // timeoutMs covers connect, TLS handshake and the response: on a weak Wi-Fi
 // link (-75 dBm and worse) a handshake alone can take over 1.5s, which is
 // what the old fixed 1.5s silently dropped replies on.
-int doNtfyPublish(const char *suffix, const char *title, const char *message, const char *priority, const char *actions, int timeoutMs) {
+int doNtfyPublish(const char *suffix, const char *title, const char *message, const char *priority, const char *actions, int timeoutMs, const char *seq, bool click) {
   if (WiFi.status() != WL_CONNECTED) return -100;
 
   WiFiClientSecure client;
@@ -4453,8 +4497,17 @@ int doNtfyPublish(const char *suffix, const char *title, const char *message, co
 
   if (title && title[0]) http.addHeader("Title", title);
   http.addHeader("Priority", priority);
-  if (!suffix[0]) http.addHeader("Tags", "house");
   if (actions && actions[0]) http.addHeader("Actions", actions);
+  if (seq && seq[0]) {
+    char sid[96];
+    ntfySeqId(seq, sid, sizeof(sid));
+    http.addHeader("X-Sequence-ID", sid);
+  }
+  if (click && !suffix[0]) {
+    char page[200];
+    phonePageUrl(page, sizeof(page));
+    http.addHeader("Click", page);
+  }
   int httpCode = http.POST((uint8_t *)message, strlen(message));
   http.end();
   return httpCode;
@@ -4473,18 +4526,55 @@ static void enqueuePush(PushNotificationParams *p) {
 // opening TLS (a handshake needs ~40KB in one piece), retries a failed send
 // twice with backoff, and reports the outcome in the counters. SD is never
 // touched here -- a failure is handed to loop() to log.
+// Cards to dismiss later (see PushNotificationParams::clearMs). A new push
+// with the same key simply moves its due time. Small: at most one entry per
+// key in practice.
+struct PendingClear { char seq[24]; unsigned long dueAt; };
+static PendingClear pendingClears[6];
+
+static void scheduleClear(const char *seq, uint32_t afterMs) {
+  int slot = -1;
+  for (int i = 0; i < 6; i++) {
+    if (pendingClears[i].seq[0] && strcmp(pendingClears[i].seq, seq) == 0) { slot = i; break; }
+    if (slot < 0 && !pendingClears[i].seq[0]) slot = i;
+  }
+  if (slot < 0) return;   // table full: skip, the card just stays
+  strncpy(pendingClears[slot].seq, seq, sizeof(pendingClears[slot].seq) - 1);
+  pendingClears[slot].seq[sizeof(pendingClears[slot].seq) - 1] = '\0';
+  pendingClears[slot].dueAt = millis() + afterMs;
+}
+
+static void cancelClear(const char *seq) {
+  for (int i = 0; i < 6; i++)
+    if (pendingClears[i].seq[0] && strcmp(pendingClears[i].seq, seq) == 0) pendingClears[i].seq[0] = '\0';
+}
+
+static void runDueClears() {
+  for (int i = 0; i < 6; i++) {
+    if (!pendingClears[i].seq[0] || (long)(millis() - pendingClears[i].dueAt) < 0) continue;
+    if (WiFi.status() != WL_CONNECTED || ESP.getMaxAllocHeap() < 44000) return;   // try next round
+    char seq[24];
+    strncpy(seq, pendingClears[i].seq, sizeof(seq)); seq[sizeof(seq) - 1] = '\0';
+    pendingClears[i].seq[0] = '\0';
+    xSemaphoreTake(tlsGate, portMAX_DELAY);
+    doNtfyClear(seq, 6000);
+    xSemaphoreGive(tlsGate);
+  }
+}
+
 static void pushWorkerTask(void *param) {
   (void)param;
   PushNotificationParams *p = nullptr;
   for (;;) {
-    if (xQueueReceive(pushQueue, &p, portMAX_DELAY) != pdTRUE || !p) continue;
+    runDueClears();
+    if (xQueueReceive(pushQueue, &p, pdMS_TO_TICKS(1000)) != pdTRUE || !p) continue;
 
     int code = -1;
     for (int attempt = 0; attempt < 3; attempt++) {
       unsigned long t0 = millis();
       while (ESP.getMaxAllocHeap() < 44000 && millis() - t0 < 10000UL) vTaskDelay(pdMS_TO_TICKS(250));
       xSemaphoreTake(tlsGate, portMAX_DELAY);
-      code = doNtfyPublish(p->suffix, p->title, p->message, p->priority, p->actions, 6000);
+      code = doNtfyPublish(p->suffix, p->title, p->message, p->priority, p->actions, 6000, p->seq, p->click);
       xSemaphoreGive(tlsGate);
       if (code == 200 || code == -100) break;          // sent, or no Wi-Fi at all
       if (code >= 400 && code < 500 && code != 429) break;  // ntfy rejected it; retrying won't help
@@ -4493,6 +4583,7 @@ static void pushWorkerTask(void *param) {
 
     if (code == 200) {
       if (statPushOk < 65535) statPushOk++;
+      if (p->seq[0]) { if (p->clearMs) scheduleClear(p->seq, p->clearMs); else cancelClear(p->seq); }
     } else {
       if (statPushFail < 65535) statPushFail++;
       statPushLastFailCode = code;
@@ -4519,16 +4610,24 @@ static void processPushFailures() {
 }
 
 void sendPushNotification(const char *title, const char *message, const char *priority) {
+  sendPushNotificationEx(title, message, priority, "", 0);
+}
+
+// seq: short key so a later push REPLACES this card instead of stacking a
+// new one ("" = plain new card). clearMs: dismiss it after this long.
+void sendPushNotificationEx(const char *title, const char *message, const char *priority, const char *seq, uint32_t clearMs) {
   if (WiFi.status() != WL_CONNECTED) return; // nothing useful we can do offline - skip entirely
 
-  PushNotificationParams *p = new PushNotificationParams();
-  p->actions[0] = '\0';
+  PushNotificationParams *p = new PushNotificationParams();   // zero-initialised
   strncpy(p->title, title, sizeof(p->title) - 1);
   p->title[sizeof(p->title) - 1] = '\0';
   strncpy(p->message, message, sizeof(p->message) - 1);
   p->message[sizeof(p->message) - 1] = '\0';
   strncpy(p->priority, priority, sizeof(p->priority) - 1);
   p->priority[sizeof(p->priority) - 1] = '\0';
+  if (seq) { strncpy(p->seq, seq, sizeof(p->seq) - 1); p->seq[sizeof(p->seq) - 1] = '\0'; }
+  p->clearMs = clearMs;
+  p->click = true;
 
   enqueuePush(p);
 }
@@ -4571,6 +4670,7 @@ enum RemoteCommand : uint8_t {
   RCMD_NONE = 0,
   RCMD_RESTART,
   RCMD_LIGHTS_OFF,
+  RCMD_LIGHTS_ON,
   RCMD_UPDATE_PORTAL,
   RCMD_STATUS,
   RCMD_HELP,
@@ -4583,8 +4683,7 @@ static volatile uint8_t pendingRemoteCommand = RCMD_NONE;
 static TaskHandle_t     remoteTaskHandle = nullptr;
 static unsigned long pendingRemoteRestartAt = 0; // nonzero = restart scheduled
 
-// Panel replies are marked so our own subscription can ignore them.
-#define REMOTE_REPLY_MARK "\xE2\x9C\x93 "   // UTF-8 checkmark + space
+// Replies carry the title "Panel"; the phone page recognises them by that.
 
 // Builds the command topic from the configured push topic. Empty push
 // topic (ntfy not set up) -> empty command topic -> listener stays idle.
@@ -4600,33 +4699,41 @@ static void remoteCommandTopic(char *out, size_t n) {
 // the same stream; the -cmd topic is a write-only address their buttons post
 // to and that they never have to see. The checkmark prefix is added here,
 // once, so a confirmation is visually distinct from a doorbell alert.
+// Quiet by design: the phone page shows the reply the moment it lands, so
+// the card is silent ("low"), replaces the previous reply instead of
+// stacking, and clears itself after five minutes.
 static void sendRemoteReply(const char *message) {
-  if (WiFi.status() != WL_CONNECTED) return;
-
-  PushNotificationParams *p = new PushNotificationParams();
-  p->actions[0] = '\0';
-  strncpy(p->title, "Panel", sizeof(p->title) - 1);
-  p->title[sizeof(p->title) - 1] = '\0';
-  snprintf(p->message, sizeof(p->message), REMOTE_REPLY_MARK "%s", message);
-  strncpy(p->priority, "default", sizeof(p->priority) - 1);
-  p->priority[sizeof(p->priority) - 1] = '\0';
-
-  enqueuePush(p);
+  sendPushNotificationEx("Panel", message, "low", "reply", 5UL * 60UL * 1000UL);
 }
 
 // Runs on the LISTENER TASK: parse one line of the ntfy JSON stream and,
 // if it is a message event, map its text onto the whitelist. No LVGL here.
-static void remoteHandleStreamLine(const char *line) {
+// Last message id seen by the poll fallback: the next poll asks for
+// everything after it, so nothing is executed twice.
+static char remoteLastPollId[24] = "";
+
+// minTime > 0 (poll fallback): ignore anything older -- a cached "restart"
+// from before a reboot must never run again.
+static void remoteHandleStreamLine(const char *line, time_t minTime) {
   if (line[0] != '{') return; // headers / blank lines, not an event
 
-  StaticJsonDocument<96> filter;
+  StaticJsonDocument<128> filter;
   filter["event"] = true;
   filter["message"] = true;
+  filter["time"] = true;
+  filter["id"] = true;
 
   // On the task's own stack: no heap churn for every keepalive line.
   StaticJsonDocument<512> doc;
   if (deserializeJson(doc, line, DeserializationOption::Filter(filter))) return;
   if (strcmp(doc["event"] | "", "message") != 0) return;
+
+  if (minTime > 0) {
+    const char *id = doc["id"] | "";
+    if (id[0]) { strncpy(remoteLastPollId, id, sizeof(remoteLastPollId) - 1); remoteLastPollId[sizeof(remoteLastPollId) - 1] = '\0'; }
+    long t = doc["time"] | 0L;
+    if (t < (long)minTime) return;
+  }
 
   const char *msg = doc["message"] | "";
   if (msg[0] == '\0') return;
@@ -4640,8 +4747,9 @@ static void remoteHandleStreamLine(const char *line) {
   }
   cmd[j] = '\0';
 
-  // Exact match, checked first: the phone page sends this on open.
+  // Exact matches, checked first: the phone page sends these.
   if      (strcmp(cmd, "ver") == 0 || strcmp(cmd, "version") == 0) pendingRemoteCommand = RCMD_VERSION;
+  else if (strcmp(cmd, "on") == 0 || strcmp(cmd, "lights on") == 0) pendingRemoteCommand = RCMD_LIGHTS_ON;
   else if (strstr(cmd, "help"))                          pendingRemoteCommand = RCMD_HELP;
   else if (strstr(cmd, "upgrade") || strstr(cmd, "install")) pendingRemoteCommand = RCMD_UPGRADE;
   else if (strstr(cmd, "restart") || strstr(cmd, "reboot")) pendingRemoteCommand = RCMD_RESTART;
@@ -4651,10 +4759,66 @@ static void remoteHandleStreamLine(const char *line) {
   else                                                   pendingRemoteCommand = RCMD_UNKNOWN;
 }
 
+// Poll fallback: while the held-open stream is down, ask the relay for
+// anything new on the command topic. One small HTTPS GET; executes only
+// messages from the last 90 s and never one it has already seen.
+static void remotePollOnce(const char *topic) {
+  if (!isTimeReadyFast()) return;            // no trustworthy clock: cannot age-filter safely
+  if (ESP.getMaxAllocHeap() < 44000) return;
+  time_t now = time(nullptr);
+  char url[200];
+  if (remoteLastPollId[0])
+    snprintf(url, sizeof(url), "https://ntfy.sh/%s/json?poll=1&since=%s", topic, remoteLastPollId);
+  else
+    snprintf(url, sizeof(url), "https://ntfy.sh/%s/json?poll=1&since=%ld", topic, (long)(now - 60));
+
+  xSemaphoreTake(tlsGate, portMAX_DELAY);
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setTimeout(8000);
+  HTTPClient http;
+  http.setConnectTimeout(8000);
+  http.setTimeout(8000);
+  if (http.begin(client, url)) {
+    int code = http.GET();
+    if (code == 200) {
+      String body = http.getString();
+      int start = 0;
+      while (start < (int)body.length()) {
+        int nl = body.indexOf('\n', start);
+        if (nl < 0) nl = body.length();
+        if (nl - start > 1 && nl - start < 1000) {
+          String line = body.substring(start, nl);
+          remoteHandleStreamLine(line.c_str(), now - 90);
+          if (pendingRemoteCommand != RCMD_NONE) { vTaskDelay(pdMS_TO_TICKS(300)); }  // let loop() take it before the next
+        }
+        start = nl + 1;
+      }
+    }
+    http.end();
+  }
+  xSemaphoreGive(tlsGate);
+}
+
+// Waits ms in one-second slices; polls the command topic every 30 s meanwhile.
+static void remoteIdleWait(unsigned long ms, const char *topic) {
+  static unsigned long lastPollAt = 0;
+  unsigned long t0 = millis();
+  while (millis() - t0 < ms) {
+    if (WiFi.status() == WL_CONNECTED && millis() - lastPollAt >= 30000UL &&
+        !firmwareUploadPortalActive && !firmwareUpdateRunning && !firmwareDownloadActive) {
+      lastPollAt = millis();
+      remotePollOnce(topic);
+    }
+    vTaskDelay(pdMS_TO_TICKS(1000));
+  }
+}
+
 static void remoteControlTask(void *param) {
   (void)param;
   char topic[80];
   static char lineBuf[1024];
+  unsigned long backoffMs = 5000;   // doubles on repeated failures, capped at 5 min
 
   for (;;) {
     remoteCommandTopic(topic, sizeof(topic));
@@ -4690,7 +4854,8 @@ static void remoteControlTask(void *param) {
       firstConnect = false;
     }
     if (!client.connect("ntfy.sh", 443)) {
-      vTaskDelay(pdMS_TO_TICKS(15000));
+      remoteIdleWait(backoffMs, topic);
+      if (backoffMs < 300000UL) backoffMs *= 2;
       continue;
     }
 
@@ -4702,21 +4867,40 @@ static void remoteControlTask(void *param) {
                   "Host: ntfy.sh\r\n"
                   "Accept: application/x-ndjson\r\n"
                   "Connection: keep-alive\r\n\r\n", topic);
+    // The relay must answer 200 before this counts as subscribed. A 429
+    // (rate limit) or 5xx used to be read as a stream that simply never
+    // spoke, and the task sat on it until the socket timed out.
+    {
+      String status = client.readStringUntil('\n');
+      if (status.indexOf(" 200") < 0) {
+        client.stop();
+        remoteLinkState = 1;
+        remoteIdleWait(backoffMs, topic);
+        if (backoffMs < 300000UL) backoffMs *= 2;
+        continue;
+      }
+    }
     remoteLinkState = 2;
+    backoffMs = 5000;
 
     size_t lineLen = 0;
+    unsigned long lastByteAt = millis();
 
+    // Liveness: ntfy sends a keepalive every ~45 s. 100 s of silence means
+    // the link is dead even if the socket still claims to be connected.
     while (client.connected() && WiFi.status() == WL_CONNECTED &&
+           millis() - lastByteAt < 100000UL &&
            !firmwareUploadPortalActive && !firmwareUpdateRunning && !firmwareDownloadActive) {
       // available() blocks (up to the socket timeout) until a TLS record
       // arrives, so this task sleeps in recv() while idle: no polling cost.
       while (client.available() > 0) {
         int ci = client.read();
         if (ci < 0) break;
+        lastByteAt = millis();
         char c = (char)ci;
         if (c == '\n') {
           lineBuf[lineLen] = '\0';
-          remoteHandleStreamLine(lineBuf);
+          remoteHandleStreamLine(lineBuf, 0);
           lineLen = 0;
         } else if (c != '\r' && lineLen < sizeof(lineBuf) - 1) {
           lineBuf[lineLen++] = c;
@@ -4728,7 +4912,7 @@ static void remoteControlTask(void *param) {
     client.stop();
     remoteLinkState = 1;
     lineLen = 0;
-    vTaskDelay(pdMS_TO_TICKS(5000)); // backoff, then resubscribe
+    remoteIdleWait(backoffMs, topic); // backoff (polling meanwhile), then resubscribe
   }
 }
 
@@ -4762,16 +4946,15 @@ static void updateSwitchDriverWatch() {
     char d[72];
     snprintf(d, sizeof(d), "Switch driver back after %lus, outputs restored", downSec);
     logActivityEvent("I2C", d);
-    if (pcfOfflineNotified) sendPushNotification("Panel", "Switch driver is responding again. Lights restored.", "default");
+    if (pcfOfflineNotified) sendPushNotificationEx("Panel", "Lights are working again.", "default", "fault", 10UL * 60UL * 1000UL);
     pcfOfflineNotified = false;
   } else if (!nowOnline && !pcfOfflineNotified && millis() - pcfOfflineSince > 90000UL) {
     // Down for a minute and a half: the bus resets have not brought it
     // back, so it almost certainly needs power removed. Say so, once.
     pcfOfflineNotified = true;
-    sendPushNotification("Panel",
-      "Switch driver not responding -- lights cannot be switched. "
-      "A software restart will not clear this: switch the panel's mains off and on.",
-      "high");
+    sendPushNotificationEx("Panel",
+      "Lights can't be switched right now. Please turn the panel's power off and on at the mains.",
+      "high", "fault", 0);
   }
 }
 
@@ -5222,17 +5405,17 @@ done:
 void startFirmwareUpgrade() {
   if (firmwareDownloadActive || firmwareUpdateRunning || firmwareUploadPortalActive) return;
   if (WiFi.status() != WL_CONNECTED) {
-    sendRemoteReply("No WiFi -- cannot download the update.");
+    sendRemoteReply("No Wi-Fi, so I can't download the update right now.");
     return;
   }
   if (!sdMounted) {
-    sendRemoteReply("SD card not ready -- cannot stage the update.");
+    sendRemoteReply("SD card isn't ready, so I can't stage the update.");
     return;
   }
   wakeScreen();
   showFirmwarePortalScreen("", "Downloading update...", "Keep power on.");
   logActivityEvent("UPDATE", "Download started");
-  sendRemoteReply("Downloading update. The panel will restart to install it.");
+  sendRemoteReply("Downloading the update. I'll restart to install it.");
   xTaskCreatePinnedToCore(fwUpgradeTask, "fwUpgrade", 12288, nullptr, 1, nullptr, 0);
 }
 
@@ -5346,14 +5529,16 @@ static void processFirmwareUpdateResults() {
         // upgrade command, nothing to open, nothing to type.
         char topic[80];
         remoteCommandTopic(topic, sizeof(topic));
-        PushNotificationParams *p = new PushNotificationParams();
-        strncpy(p->title, "Panel update", sizeof(p->title) - 1); p->title[sizeof(p->title) - 1] = 0;
+        PushNotificationParams *p = new PushNotificationParams();   // zero-initialised
+        strncpy(p->title, "Panel", sizeof(p->title) - 1); p->title[sizeof(p->title) - 1] = 0;
         snprintf(p->message, sizeof(p->message),
-                 "Version %s is available (you have %s). Install takes about a minute.",
-                 firmwareUpdateVersion, FW_VERSION);
+                 "Update %s is ready. Installing takes about a minute.",
+                 firmwareUpdateVersion);
         strncpy(p->priority, "default", sizeof(p->priority) - 1); p->priority[sizeof(p->priority) - 1] = 0;
+        strncpy(p->seq, "update", sizeof(p->seq) - 1);   // one card per panel, replaced by newer versions
+        p->click = true;
         snprintf(p->actions, sizeof(p->actions),
-                 "http, Install now, https://ntfy.sh/%s, method=POST, body=upgrade, clear=true", topic);
+                 "http, Install, https://ntfy.sh/%s, method=POST, body=upgrade, clear=true", topic);
         enqueuePush(p);
         snprintf(msg, sizeof(msg), "Update %s available", firmwareUpdateVersion);
         logActivityEvent("UPDATE", msg);
@@ -5361,7 +5546,7 @@ static void processFirmwareUpdateResults() {
       break;
     }
     case FWR_UP_TO_DATE:
-      snprintf(msg, sizeof(msg), "Already up to date (%s).", FW_VERSION);
+      snprintf(msg, sizeof(msg), "Already up to date (%s). Nothing to do.", FW_VERSION);
       sendRemoteReply(msg);
       showFirmwarePortalScreen("", "Already up to date", "No newer version published.");
       break;
@@ -5384,7 +5569,7 @@ static void processFirmwareUpdateResults() {
       }
       snprintf(msg, sizeof(msg), "Downloaded %s, installing", firmwareUpdateVersion);
       logActivityEvent("UPDATE", msg);
-      snprintf(msg, sizeof(msg), "Update %s downloaded. Installing now -- back in about a minute.",
+      snprintf(msg, sizeof(msg), "Update %s downloaded. Installing now, back in about a minute.",
                firmwareUpdateVersion);
       sendRemoteReply(msg);
       showFirmwarePortalScreen("", "Update downloaded", "Restarting to install. Keep power on.");
@@ -5432,7 +5617,32 @@ static void processRemoteCommand() {
       updateAutoLightUI();
       updateStatus("Status: Lights OFF (remote)");
       logActivityEvent("REMOTE", "Lights switched off remotely");
-      sendRemoteReply("All lights off. Motion automation back to AUTO.");
+      sendRemoteReply("Lights off. Motion sensing is back in charge.");
+      break;
+    }
+
+    case RCMD_LIGHTS_ON: {
+      // The non-motion light: plain on.
+      if (autoLightTarget == AUTO_TARGET_CEILING) {
+        panelOutputState = true;
+        pcfSetPin(PCF_PANEL_PIN, true);
+        updatePanelUI();
+      } else {
+        ceilingState = true;
+        pcfSetPin(PCF_CEILING_PIN, true);
+        updateCeilingUI();
+      }
+      // The motion light: a manual-on session, exactly like tapping its
+      // tile on the panel -- it stays on until switched off or the usual
+      // sunrise / safety cutoff.
+      autoMode = AUTO_MODE_MANUAL_ON;
+      autoManualStartedAt = millis();
+      autoManualOffStartedAt = 0;
+      applyAutoOutput(true);
+      updateAutoLightUI();
+      updateStatus("Status: Lights ON (remote)");
+      logActivityEvent("REMOTE", "Lights switched on remotely");
+      sendRemoteReply("Lights on. They stay on until you say otherwise, or sunrise.");
       break;
     }
 
@@ -5441,7 +5651,7 @@ static void processRemoteCommand() {
       char msg[160];
       IPAddress ip = WiFi.localIP();
       snprintf(msg, sizeof(msg),
-               "Update portal open for 5 min (home WiFi only): http://%u.%u.%u.%u/update",
+               "Update portal open for 5 minutes, home Wi-Fi only: http://%u.%u.%u.%u/update",
                ip[0], ip[1], ip[2], ip[3]);
       sendRemoteReply(msg);
       startFirmwareUploadPortal(); // has its own 5-minute auto-close window
@@ -5450,22 +5660,22 @@ static void processRemoteCommand() {
 
     case RCMD_RESTART: {
       logActivityEvent("REMOTE", "Restart requested remotely");
-      sendRemoteReply("Restarting now. Back in about 20 seconds.");
+      sendRemoteReply("Restarting. Back in about 20 seconds.");
       pendingRemoteRestartAt = millis() + 2500; // let the reply leave first
       break;
     }
 
     case RCMD_STATUS: {
       char msg[200];
-      snprintf(msg, sizeof(msg),
-               "v%s | up %lu min | heap %uK free, %uK block | WiFi %d dBm | ceiling %s | panel %s",
-               FW_VERSION,
-               millis() / 60000UL,
-               (unsigned)(ESP.getFreeHeap() / 1024),
-               (unsigned)(ESP.getMaxAllocHeap() / 1024),
-               WiFi.status() == WL_CONNECTED ? (int)WiFi.RSSI() : 0,
-               ceilingState ? "ON" : "off",
-               panelOutputState ? "ON" : "off");
+      unsigned long upMin = millis() / 60000UL;
+      int rssi = WiFi.status() == WL_CONNECTED ? (int)WiFi.RSSI() : 0;
+      const char *wifi = rssi == 0 ? "off" : rssi >= -65 ? "strong" : rssi >= -75 ? "good" : "weak";
+      if (upMin >= 60)
+        snprintf(msg, sizeof(msg), "All good. v%s, up %lu h %lu min, Wi-Fi %s. Ceiling %s, wall light %s.",
+                 FW_VERSION, upMin / 60, upMin % 60, wifi, ceilingState ? "on" : "off", panelOutputState ? "on" : "off");
+      else
+        snprintf(msg, sizeof(msg), "All good. v%s, up %lu min, Wi-Fi %s. Ceiling %s, wall light %s.",
+                 FW_VERSION, upMin, wifi, ceilingState ? "on" : "off", panelOutputState ? "on" : "off");
       sendRemoteReply(msg);
       break;
     }
@@ -5492,18 +5702,17 @@ static void processRemoteCommand() {
 
     case RCMD_HELP: {
       sendRemoteReply(
-        "Panel controls -- send a word here:\n"
-        "off = all lights off\n"
-        "restart = reboot the panel\n"
+        "Send me a word:\n"
+        "on / off = lights\n"
+        "status = how I'm doing\n"
+        "restart = reboot\n"
         "upgrade = install the latest firmware\n"
-        "update = open update portal (5 min)\n"
-        "status = health check\n"
-        "help = this list");
+        "update = open the update portal (5 min)");
       break;
     }
 
     case RCMD_UNKNOWN: {
-      sendRemoteReply("Didn't catch that. Commands: off, restart, upgrade, update, status, help");
+      sendRemoteReply("Didn't catch that. Try: on, off, status, restart, upgrade, help.");
       break;
     }
   }
@@ -5553,13 +5762,13 @@ void updateAutoLightManualOnReminder() {
 
   if (isAutoReminderQuietHoursNow()) return;
 
-  const char *lightName = (autoLightTarget == AUTO_TARGET_CEILING) ? "Ceiling Light" : "Wall Accent Light";
+  const char *lightName = (autoLightTarget == AUTO_TARGET_CEILING) ? "Ceiling Light" : "Wall Light";
   char message[120];
-  snprintf(message, sizeof(message),
-    "%s has been on (manual mode) for over %d hours - just checking it wasn't left on.",
-    lightName, (int)(onForMs / 3600000UL));
+  int hrs = (int)(onForMs / 3600000UL);
+  snprintf(message, sizeof(message), "Still on after %d hour%s. Left on by mistake?", hrs, hrs == 1 ? "" : "s");
 
-  sendPushNotification(lightName, message, "default");
+  // Replaces the previous reminder rather than stacking one per hour.
+  sendPushNotificationEx(lightName, message, "default", "light", 0);
 }
 
 
@@ -5816,7 +6025,29 @@ void checkWelcomeOverlayTrigger() {
     logActivityEvent("MOTION", "No doorbell - welcome shown");
 
     if (NOTIFY_ON_MOTION_NO_BELL) {
-      sendPushNotification("Front Porch", "Motion detected", "low");
+      // One silent card that counts up ("3 times since 6:10 pm") instead of
+      // a new card per event; a quiet half hour starts a fresh count and the
+      // old card dismisses itself.
+      static unsigned long burstStartedAt = 0, lastAt = 0;
+      static int count = 0;
+      static char sinceText[16] = "";
+      if (lastAt == 0 || millis() - lastAt > 30UL * 60UL * 1000UL) {
+        count = 0; burstStartedAt = millis();
+        sinceText[0] = '\0';
+        if (isTimeReadyFast()) {
+          struct tm t; getLocalTmFast(&t);
+          int h12 = t.tm_hour % 12; if (h12 == 0) h12 = 12;
+          snprintf(sinceText, sizeof(sinceText), "%d:%02d %s", h12, t.tm_min, t.tm_hour < 12 ? "am" : "pm");
+        }
+      }
+      lastAt = millis();
+      count++;
+      char msg[96];
+      if (count == 1)           snprintf(msg, sizeof(msg), "Movement outside.");
+      else if (sinceText[0])    snprintf(msg, sizeof(msg), "Movement outside, %d times since %s.", count, sinceText);
+      else                      snprintf(msg, sizeof(msg), "Movement outside, %d times.", count);
+      (void)burstStartedAt;
+      sendPushNotificationEx("Front Porch", msg, "low", "motion", 30UL * 60UL * 1000UL);
     }
 
     // Only greet on the main dashboard (skip diagnostics/admin/portal screens).
