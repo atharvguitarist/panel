@@ -345,6 +345,42 @@
   }
   .update button.confirm { background: var(--wine-dark); }
 
+  /* ---- Activity (read from the relay's 12-hour cache; the panel is never asked) ---- */
+  .log { margin-top: 14px; display: none; }
+  .log.show { display: block; }
+  .log-row {
+    display: flex;
+    gap: 10px;
+    padding: 9px 0;
+    border-top: 1px solid var(--line);
+    font-size: 13px;
+    line-height: 1.4;
+  }
+  .log-row:first-child { border-top: 0; }
+  .log-time { flex: 0 0 52px; color: var(--ink-soft); font-variant-numeric: tabular-nums; }
+  .log-text { flex: 1; min-width: 0; color: var(--ink); word-break: break-word; }
+  .log-text em { font-style: normal; color: var(--ink-soft); }
+  .log-row.ok .log-text { color: var(--gold-text); }
+  .log-empty { padding: 10px 0; font-size: 13px; color: var(--ink-soft); }
+  .card .actions { display: flex; gap: 10px; }
+  .card .actions button {
+    width: auto; flex: 1;
+    padding: 11px 10px;
+    font-size: 13px; font-weight: 500;
+    color: var(--gold-text);
+    background: var(--bg);
+    border: 1px solid var(--line);
+    border-radius: 11px;
+  }
+  .update .steps { margin-top: 6px; font-size: 12px; color: var(--ink-soft); letter-spacing: .02em; }
+  .update .steps b { color: var(--ink); font-weight: 600; }
+  .update.fail strong { color: #A3302B; }
+  .update.done strong { color: #2E6B3A; }
+  @media (prefers-color-scheme: dark) {
+    .update.done strong { color: #8FD19E; }
+    .update.fail strong { color: #F08A84; }
+  }
+
   /* Shown instead of everything when the link carries no topic. */
   .nolink {
     text-align: center;
@@ -394,8 +430,8 @@
     <button class="secondary wide" id="btn-update" data-confirm="1">Allow Update &middot; 5 min</button>
   </div>
 
-  <div class="update" id="update" role="note">
-    <div class="text" id="update-text"></div>
+  <div class="update" id="update" role="status" aria-live="polite">
+    <div class="text"><div id="update-text"></div><div class="steps" id="update-steps"></div></div>
     <button id="btn-upgrade">Update</button>
   </div>
 
@@ -418,6 +454,16 @@
       <a href="https://apps.apple.com/app/ntfy/id1625396347" target="_blank" rel="noopener">iPhone</a>
       <a href="https://play.google.com/store/apps/details?id=io.heckel.ntfy" target="_blank" rel="noopener">Android</a>
     </div>
+  </div>
+
+  <div class="card" style="margin-top:14px">
+    <h2>Activity</h2>
+    <p>The last 12 hours of alerts and confirmations, read from the notification
+       relay &mdash; nothing is asked of the panel.</p>
+    <div class="actions">
+      <button id="btn-log">Show activity</button>
+    </div>
+    <div class="log" id="log"></div>
   </div>
 
   <footer>
@@ -612,38 +658,121 @@
   var statusEl = document.getElementById("status");
   var statusTimer = null;
 
-  function say(msg, isError) {
+  function say(msg, isError, holdMs) {
     statusEl.textContent = msg;
     statusEl.classList.toggle("err", !!isError);
     statusEl.classList.add("show");
     clearTimeout(statusTimer);
     statusTimer = setTimeout(function () {
       statusEl.classList.remove("show");
-    }, 4200);
+    }, holdMs || 4200);
+  }
+
+  // ---- Reading what the panel says back -----------------------------------
+  // The relay keeps every message for 12 hours, so the phone can read the
+  // panel's confirmations straight from the relay's cache. The panel is not
+  // involved in any of these reads -- it only ever sees the commands.
+  var MAIN_URL = "https://ntfy.sh/" + topic + "/json?poll=1&since=";
+  var VER_URL  = "https://ntfy.sh/" + topic + "-ver/json?poll=1&since=";
+  var MARK = "✓ ";   // the panel prefixes its own replies with a checkmark
+
+  function nowSec() { return Math.floor(Date.now() / 1000); }
+
+  function pollTopic(url, since) {
+    return fetch(url + since, { cache: "no-store" })
+      .then(function (r) { return r.text(); })
+      .then(function (body) {
+        var out = [];
+        body.split("\n").forEach(function (line) {
+          try {
+            var m = JSON.parse(line);
+            if (m.event === "message") out.push({ time: m.time || 0, title: m.title || "", message: m.message || "" });
+          } catch (e) { /* framing / blank */ }
+        });
+        return out;
+      })
+      .catch(function () { return []; });
+  }
+
+  // Replies the panel posted at or after `since` (unix seconds), oldest first.
+  function panelReplies(since) {
+    return pollTopic(MAIN_URL, since).then(function (list) {
+      return list.filter(function (m) { return m.message.indexOf(MARK) === 0 && m.time >= since; })
+                 .map(function (m) { m.message = m.message.slice(MARK.length); return m; });
+    });
+  }
+
+  // Resolves with the first reply matching `test` within timeoutMs, else "".
+  function waitReply(since, timeoutMs, test) {
+    var deadline = Date.now() + timeoutMs;
+    return new Promise(function (resolve) {
+      (function poll() {
+        panelReplies(since).then(function (list) {
+          for (var i = 0; i < list.length; i++) {
+            if (!test || test(list[i].message)) return resolve(list[i].message);
+          }
+          if (Date.now() < deadline) setTimeout(poll, 2000); else resolve("");
+        });
+      })();
+    });
+  }
+
+  // Ask the panel which firmware it runs. The panel answers on <topic>-ver
+  // (which no phone subscribes to) at most once every 20 s, so an answer it
+  // gave in the last 25 s is accepted too -- otherwise a quick reload would
+  // look like a dead panel.
+  var verInFlight = null;
+  function askVersion(timeoutMs) {
+    if (verInFlight) return verInFlight;
+    var since = nowSec() - 25;
+    var deadline = Date.now() + (timeoutMs || 12000);
+    fetch(CMD_URL, { method: "POST", body: "ver", mode: "no-cors" }).catch(function () {});
+    verInFlight = new Promise(function (resolve) {
+      (function poll() {
+        pollTopic(VER_URL, since).then(function (list) {
+          var found = "";
+          list.forEach(function (m) { if (/^\d+\.\d+\.\d+$/.test(m.message)) found = m.message; });
+          if (found) return resolve(found);
+          if (Date.now() < deadline) setTimeout(poll, 1500); else resolve("");
+        });
+      })();
+    }).then(function (v) { verInFlight = null; return v; });
+    return verInFlight;
   }
 
   // ---- Sending -----------------------------------------------------------
-  // The panel confirms every command with its own push notification, so the
-  // page never needs to read a response. It still tries a normal request
-  // first (to catch a genuine network failure and say so) and falls back to
-  // no-cors, which always goes through regardless of CORS headers.
+  // Tries a normal request first (to catch a genuine network failure and say
+  // so) and falls back to no-cors, which always goes through regardless of
+  // CORS headers. Then it reads the panel's own confirmation off the relay
+  // and shows it, so the status line reports what actually happened.
   function send(cmd, btn, restore) {
     btn.disabled = true;
     say("Sending…");
+    var since = nowSec() - 1;
 
     fetch(CMD_URL, { method: "POST", body: cmd })
-      .then(function () {
-        say("Sent — watch for the confirmation.");
-      })
+      .then(function () { return true; })
       .catch(function () {
         return fetch(CMD_URL, { method: "POST", body: cmd, mode: "no-cors" })
-          .then(function () { say("Sent — watch for the confirmation."); })
-          .catch(function () { say("No connection. Try again.", true); });
+          .then(function () { return true; })
+          .catch(function () { return false; });
       })
-      .then(function () {
+      .then(function (sent) {
         btn.disabled = false;
         btn.textContent = restore;
         btn.classList.remove("confirm");
+        if (!sent) { say("No connection. Try again.", true); return; }
+        say("Sent — waiting for the panel…", false, 20000);
+        return waitReply(since, 18000).then(function (reply) {
+          if (reply) {
+            say(reply, false, 9000);
+            link.online();
+            if (/^Restarting/.test(reply)) setTimeout(function () { link.check(); }, 35000);
+          } else {
+            say("Sent, but no confirmation yet — the panel may be reconnecting. It will catch up on its own.", true, 9000);
+            link.check();
+          }
+        });
       });
   }
 
@@ -681,18 +810,22 @@
   wire("btn-restart", "restart");
   wire("btn-update",  "update");
 
-  // ---- Firmware update check ----------------------------------------------
-  // The panel is asked which version it runs ("ver"); it answers on the
-  // side topic <topic>-ver, which no phone subscribes to, so nothing pings.
-  // The published version comes from firmware/manifest.json on this same
-  // host. The row appears only if the published one is newer. Older
-  // firmware that doesn't know "ver" simply never answers: no row.
-  (function updateCheck() {
-    var box  = document.getElementById("update");
-    var text = document.getElementById("update-text");
-    var btn  = document.getElementById("btn-upgrade");
+  // ---- Link check, update offer, update progress ---------------------------
+  // On open the panel is asked for its version. If it answers, the published
+  // version (firmware/manifest.json on this host) is compared and an Update
+  // row appears when newer. If it does not answer, the page says so and keeps
+  // asking quietly in the background -- a panel that is restarting or whose
+  // Wi-Fi dropped comes back on its own, and the row disappears the moment it
+  // does. Nobody has to reload, and nothing has to be power-cycled.
+  var link = (function () {
+    var box   = document.getElementById("update");
+    var text  = document.getElementById("update-text");
+    var steps = document.getElementById("update-steps");
+    var btn   = document.getElementById("btn-upgrade");
     var badge = document.getElementById("badge");
-    var VER_URL = "https://ntfy.sh/" + topic + "-ver/json?poll=1&since=";
+
+    var running = "", latest = "", mode = "";   // mode: "" | "offline" | "offer" | "updating"
+    var retryTimer = null, offlineSince = 0;
 
     function parts(v) { return String(v || "").split(".").map(function (n) { return parseInt(n, 10) || 0; }); }
     function newer(a, b) {
@@ -700,82 +833,188 @@
       for (var i = 0; i < 3; i++) { if ((x[i] || 0) !== (y[i] || 0)) return (x[i] || 0) > (y[i] || 0); }
       return false;
     }
-
-    function askPanel() {
-      var since = Math.floor(Date.now() / 1000) - 2;
-      fetch(CMD_URL, { method: "POST", body: "ver", mode: "no-cors" }).catch(function () {});
-      return new Promise(function (resolve) {
-        var tries = 0;
-        (function poll() {
-          tries++;
-          fetch(VER_URL + since, { cache: "no-store" })
-            .then(function (r) { return r.text(); })
-            .then(function (body) {
-              var found = "";
-              body.split("\n").forEach(function (line) {
-                try { var m = JSON.parse(line); if (m.event === "message" && /^\d+\.\d+\.\d+$/.test(m.message)) found = m.message; } catch (e) {}
-              });
-              if (found) return resolve(found);
-              if (tries < 8) setTimeout(poll, 1500); else resolve("");
-            })
-            .catch(function () { if (tries < 8) setTimeout(poll, 1500); else resolve(""); });
-        })();
-      });
+    function show(cls) {
+      box.className = "update show" + (cls ? " " + cls : "");
     }
+    function hide() { box.className = "update"; steps.textContent = ""; }
+    function setBtn(label) { btn.style.display = ""; btn.disabled = false; btn.textContent = label; btn.classList.remove("confirm"); }
 
     var published = fetch("firmware/manifest.json?t=" + Date.now(), { cache: "no-store" })
       .then(function (r) { return r.ok ? r.json() : {}; })
-      .then(function (m) { return (m && m.version) || ""; })
-      .catch(function () { return ""; });
+      .then(function (m) { latest = (m && m.version) || ""; })
+      .catch(function () {});
 
-    // A beat after load, so opening the page stays instant.
-    setTimeout(function () {
-      Promise.all([askPanel(), published]).then(function (v) {
-        var running = v[0], latest = v[1];
-        if (!running) {
-          // No answer in ~12 s. Say so instead of letting buttons look dead:
-          // the page can always post, but only a listening panel acts on it.
-          offline = true;
-          text.innerHTML = "<strong>Panel isn't answering</strong><br>Check it is on and connected to Wi-Fi. " +
-                           "If it was reset, re-link it from its Phone setup screen.";
-          btn.textContent = "Re-link";
-          box.classList.add("show");
-          return;
+    function gotVersion(v) {
+      running = v;
+      badge.textContent = topic + "  ·  v" + running;
+      if (mode === "offline") { hide(); mode = ""; say("Panel is back online.", false, 5000); }
+      clearTimeout(retryTimer); retryTimer = null; offlineSince = 0;
+      if (mode === "updating") return;
+      published.then(function () {
+        if (latest && newer(latest, running)) {
+          mode = "offer";
+          text.innerHTML = "<strong>Update available</strong><br>Version " + latest + " &middot; you have " + running;
+          setBtn("Update");
+          show();
         }
-        badge.textContent = topic + "  \u00b7  v" + running;
-        if (!latest || !newer(latest, running)) return;
-        text.innerHTML = "<strong>Update available</strong><br>Version " + latest +
-                         " &middot; you have " + running;
-        box.classList.add("show");
       });
-    }, 600);
+    }
 
-    var offline = false;
+    function wentQuiet() {
+      if (mode === "updating") return;
+      if (!offlineSince) offlineSince = Date.now();
+      mode = "offline";
+      var mins = Math.round((Date.now() - offlineSince) / 60000);
+      text.innerHTML = "<strong>Panel isn't answering</strong><br>" +
+        (mins < 1 ? "Checking again in the background. A panel that is restarting or lost Wi-Fi comes back on its own; the buttons work again the moment it does."
+                  : "Still quiet after " + mins + " min. If it stays like this, check its Wi-Fi from the panel's own settings screen. " +
+                    "If the panel was set up again, re-link it from the Phone setup screen.");
+      setBtn("Retry");
+      show();
+      // Every 30 s for the first ten minutes, then every 2 min. Paused while
+      // the page is hidden, so a backgrounded app never keeps sending.
+      var wait = (Date.now() - offlineSince < 600000) ? 30000 : 120000;
+      clearTimeout(retryTimer);
+      retryTimer = setTimeout(check, wait);
+    }
+
+    function check() {
+      if (document.hidden) { retryTimer = setTimeout(check, 15000); return; }
+      return askVersion(12000).then(function (v) { if (v) gotVersion(v); else wentQuiet(); });
+    }
+
+    document.addEventListener("visibilitychange", function () {
+      // Coming back to the app after a while: one fresh look, no waiting.
+      if (!document.hidden && mode === "offline") { clearTimeout(retryTimer); check(); }
+    });
+
+    // ---- Update progress --------------------------------------------------
+    // The panel narrates the update on the main topic ("Downloading update",
+    // "downloaded. Installing now", "Update failed: ..."), then reboots. The
+    // page follows those replies, and once the panel has gone down for the
+    // install it asks for the version until the new one answers.
+    function runUpdate() {
+      mode = "updating";
+      var since = nowSec() - 1, target = latest, deadline = Date.now() + 8 * 60000;
+      btn.style.display = "none";
+      show();
+      function stage(title, body, s) {
+        text.innerHTML = "<strong>" + title + "</strong><br>" + body;
+        steps.innerHTML = s;
+      }
+      function bar(n) {   // 1 sent, 2 downloading, 3 installing, 4 done
+        var names = ["Sent", "Downloading", "Installing", "Done"];
+        return names.map(function (nm, i) { return i + 1 <= n ? "<b>" + nm + "</b>" : nm; }).join(" &rsaquo; ");
+      }
+      function fail(why) {
+        mode = "";
+        text.innerHTML = "<strong>Update didn't finish</strong><br>" + why;
+        steps.textContent = "";
+        setBtn("Try again");
+        show("fail");
+      }
+      stage("Updating to " + target, "Asking the panel to download it…", bar(1));
+      fetch(CMD_URL, { method: "POST", body: "upgrade", mode: "no-cors" }).catch(function () {});
+
+      var seenInstall = false;
+      (function follow() {
+        if (Date.now() > deadline) return fail("No word from the panel for 8 minutes. Reopen this page later to see which version it runs.");
+        panelReplies(since).then(function (list) {
+          list.forEach(function (m) {
+            var t = m.message;
+            if (/^Downloading update/.test(t))              stage("Updating to " + target, "Downloading on the panel… this takes about a minute.", bar(2));
+            else if (/downloaded\. Installing/.test(t))     { seenInstall = true; stage("Updating to " + target, "Downloaded and verified. Installing — the panel restarts itself; back in about a minute.", bar(3)); }
+            else if (/^Update failed/.test(t))              { fail(t.replace(/^Update failed:\s*/, "")); seenInstall = "fail"; }
+            else if (/^Already up to date/.test(t))         { mode = ""; text.innerHTML = "<strong>Already up to date</strong><br>" + t; steps.textContent = ""; show("done"); seenInstall = "done"; }
+            else if (/^No WiFi|^SD card/.test(t))           { fail(t); seenInstall = "fail"; }
+          });
+          if (seenInstall === "fail" || seenInstall === "done") return;
+          if (!seenInstall) return setTimeout(follow, 2500);
+          // Installing: wait for the reboot, then ask for the version until
+          // the new one answers (the panel answers at most once per 20 s).
+          setTimeout(function confirmVersion() {
+            if (Date.now() > deadline) return fail("The panel restarted but hasn't reported the new version yet. Reopen this page in a minute.");
+            askVersion(10000).then(function (v) {
+              if (v && !newer(target, v)) {
+                mode = ""; running = v;
+                badge.textContent = topic + "  ·  v" + v;
+                text.innerHTML = "<strong>Updated to " + v + "</strong><br>The panel is back and running the new version.";
+                steps.innerHTML = bar(4);
+                show("done");
+                setTimeout(hide, 20000);
+              } else if (v) {
+                // Still the old version: the install was rejected at boot.
+                fail("The panel came back on " + v + " — the new image was not applied. Try again.");
+              } else {
+                setTimeout(confirmVersion, 25000);
+              }
+            });
+          }, 30000);
+        });
+      })();
+    }
+
     var armed = false, armTimer = null;
     btn.addEventListener("click", function () {
-      if (offline) { relink(); return; }
+      if (mode === "offline") { clearTimeout(retryTimer); btn.disabled = true; btn.textContent = "Checking…"; check().then(function () { btn.disabled = false; }); return; }
+      if (mode === "updating") return;
       if (!armed) {
         armed = true;
         btn.textContent = "Tap again";
         btn.classList.add("confirm");
-        armTimer = setTimeout(function () { armed = false; btn.textContent = "Update"; btn.classList.remove("confirm"); }, 3500);
+        armTimer = setTimeout(function () { armed = false; btn.textContent = mode === "offer" ? "Update" : "Try again"; btn.classList.remove("confirm"); }, 3500);
         return;
       }
       clearTimeout(armTimer);
       armed = false;
-      btn.disabled = true;
-      fetch(CMD_URL, { method: "POST", body: "upgrade", mode: "no-cors" })
-        .then(function () {
-          text.innerHTML = "<strong>Updating</strong><br>The panel restarts by itself in about a minute.";
-          btn.style.display = "none";
-        })
-        .catch(function () {
-          btn.disabled = false;
-          btn.textContent = "Update";
-          btn.classList.remove("confirm");
-          say("No connection. Try again.", true);
-        });
+      runUpdate();
     });
+
+    // A beat after load, so opening the page stays instant.
+    setTimeout(check, 600);
+
+    return {
+      check: function () { if (mode !== "updating") { clearTimeout(retryTimer); check(); } },
+      online: function () { if (mode === "offline") { clearTimeout(retryTimer); check(); } }
+    };
+  })();
+
+  // ---- Activity ------------------------------------------------------------
+  // Everything the panel has pushed in the last 12 hours -- doorbell, motion,
+  // light notices and its replies to commands -- straight from the relay's
+  // cache. The panel is not contacted; this is the phone reading ntfy.
+  (function activity() {
+    var btnLog = document.getElementById("btn-log");
+    var list   = document.getElementById("log");
+    var open = false;
+
+    function esc(s) { return String(s).replace(/[&<>]/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]; }); }
+    function hhmm(t) {
+      var d = new Date(t * 1000), h = d.getHours(), m = d.getMinutes();
+      return (h < 10 ? "0" : "") + h + ":" + (m < 10 ? "0" : "") + m;
+    }
+    function load() {
+      btnLog.disabled = true; btnLog.textContent = "Loading…";
+      pollTopic(MAIN_URL, "12h").then(function (msgs) {
+        msgs.sort(function (a, b) { return b.time - a.time; });
+        msgs = msgs.slice(0, 80);
+        if (!msgs.length) {
+          list.innerHTML = '<div class="log-empty">Nothing in the last 12 hours.</div>';
+        } else {
+          list.innerHTML = msgs.map(function (m) {
+            var ok = m.message.indexOf(MARK) === 0;
+            var body = ok ? m.message.slice(MARK.length) : m.message;
+            var title = ok ? "" : (m.title ? "<em>" + esc(m.title) + " &middot; </em>" : "");
+            return '<div class="log-row' + (ok ? " ok" : "") + '"><div class="log-time">' + hhmm(m.time) +
+                   '</div><div class="log-text">' + title + esc(body) + '</div></div>';
+          }).join("");
+        }
+        list.classList.add("show");
+        open = true;
+        btnLog.disabled = false; btnLog.textContent = "Refresh";
+      });
+    }
+    btnLog.addEventListener("click", load);
   })();
 
   // ---- Copy topic --------------------------------------------------------
