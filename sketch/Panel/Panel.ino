@@ -179,7 +179,7 @@ const char* PHONE_UI_BASE_URL = "https://atharvguitarist.github.io/panel/";
 // straight out of the uploaded .bin -- change ONLY the number. FW_VERSION
 // points past the tag, so every existing use is unchanged, and because it is
 // used everywhere the linker can never strip the tag from the binary.
-const char  FW_VERSION_TAG[] = "PANELFW:5.6.19";
+const char  FW_VERSION_TAG[] = "PANELFW:5.6.20";
 const char* FW_VERSION = FW_VERSION_TAG + 8;
 const char* FW_MANIFEST_PATH = "firmware/manifest.json";
 const char* FW_BINARY_PATH   = "firmware/latest.bin";
