@@ -66,9 +66,10 @@ jobs:
           ls -l firmware/symbols.txt.gz
 
       - name: Build report (run summary)
+        continue-on-error: true   # admin info only -- never blocks a release
         run: |
-          BIN=$(ls "$HOME"/.arduino15/packages/esp32/tools/xtensa-esp32s3-elf-gcc/*/bin | head -1)
-          "$BIN/xtensa-esp32s3-elf-size" -A out/Panel.ino.elf > out/size.txt
+          SIZE=$(ls "$HOME"/.arduino15/packages/esp32/tools/xtensa-esp32s3-elf-gcc/*/bin/xtensa-esp32s3-elf-size | head -1)
+          "$SIZE" -A out/Panel.ino.elf > out/size.txt
           git show HEAD:firmware/manifest.json > out/prev.json 2>/dev/null || echo '{}' > out/prev.json
           python3 -I tools/build_report.py out/size.txt out/Panel.ino.bin out/prev.json sketch/versions.env >> "$GITHUB_STEP_SUMMARY"
           cat "$GITHUB_STEP_SUMMARY"
