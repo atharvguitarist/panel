@@ -455,6 +455,7 @@ void showFirmwarePortalScreen(const char *message, const char *urlText, const ch
 void startFirmwareUpgrade();
 void startFirmwareUpdateCheck();
 int  doNtfyPublish(const char *suffix, const char *title, const char *message, const char *priority, const char *actions, int timeoutMs = 4000, const char *seq = nullptr, bool click = false);
+void sendPushNotificationEx(const char *title, const char *message, const char *priority, const char *seq, uint32_t clearMs);
 void updateWeatherIconDisplay(bool forceReload = false);
 void updateWeather();
 static void weatherTickerReset();
