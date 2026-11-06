@@ -52,8 +52,18 @@ jobs:
 
       - name: Compile
         run: |
+          # PANEL_CRASH_NOTE + the --wrap flag switch on the crash recorder in
+          # the sketch: a panic is written to the activity log on the next boot.
           arduino-cli compile --fqbn "$FQBN" --libraries sketch/libraries \
+            --build-property "compiler.cpp.extra_flags=-DPANEL_CRASH_NOTE" \
+            --build-property "compiler.c.elf.extra_flags=-Wl,--wrap=esp_panic_handler" \
             --output-dir out sketch/Panel
+
+      - name: Export symbol table (turns a logged crash address into a function name)
+        run: |
+          NM=$(ls "$HOME"/.arduino15/packages/esp32/tools/xtensa-esp32s3-elf-gcc/*/bin/xtensa-esp32s3-elf-nm | head -1)
+          "$NM" -n --defined-only out/Panel.ino.elf | awk '$2 ~ /^[tTwW]$/ {print $1, $3}' | gzip -9 > firmware/symbols.txt.gz
+          ls -l firmware/symbols.txt.gz
 
       - name: Size check (slot is 1,966,080 bytes)
         run: |
