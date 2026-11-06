@@ -456,7 +456,7 @@
     <button class="secondary" id="btn-status">Check Status</button>
     <button class="secondary" id="btn-restart" data-confirm="1">Restart Panel</button>
     <button class="secondary" id="btn-update" data-confirm="1">Allow Update &middot; 5 min</button>
-    <button class="secondary" id="btn-log">Activity</button>
+    <button class="secondary" id="btn-log">Recent Alerts</button>
   </div>
 
   <div class="update" id="update" role="status" aria-live="polite">
@@ -494,9 +494,9 @@
 </div>
 
 <div class="sheet-bg" id="sheet-bg"></div>
-<div class="sheet" id="sheet" role="dialog" aria-label="Activity">
+<div class="sheet" id="sheet" role="dialog" aria-label="Recent alerts">
   <div class="sheet-head">
-    <h2>Activity<small>Last 12 hours</small></h2>
+    <h2>Recent Alerts<small>Last 12 hours</small></h2>
     <button id="sheet-close" aria-label="Close">&times;</button>
   </div>
   <div class="log" id="log"></div>
@@ -1029,7 +1029,7 @@
         msgs.sort(function (a, b) { return b.time - a.time; });
         msgs = msgs.slice(0, 80);
         if (!msgs.length) {
-          list.innerHTML = '<div class="log-empty">Nothing in the last 12 hours.</div>';
+          list.innerHTML = '<div class="log-empty">No alerts in the last 12 hours.</div>';
           return;
         }
         list.innerHTML = msgs.map(function (m) {
