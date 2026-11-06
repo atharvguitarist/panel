@@ -454,6 +454,11 @@ void savePhoneSetupPending(bool pending);
 void showFirmwarePortalScreen(const char *message, const char *urlText, const char *hintText);
 void startFirmwareUpgrade();
 void startFirmwareUpdateCheck();
+#ifdef PANEL_CRASH_NOTE
+struct PanelPanicInfo;
+extern "C" void __wrap_esp_panic_handler(PanelPanicInfo *info);
+extern "C" void __real_esp_panic_handler(PanelPanicInfo *info);
+#endif
 int  doNtfyPublish(const char *suffix, const char *title, const char *message, const char *priority, const char *actions, int timeoutMs = 4000, const char *seq = nullptr, bool click = false);
 void sendPushNotificationEx(const char *title, const char *message, const char *priority, const char *seq, uint32_t clearMs);
 void updateWeatherIconDisplay(bool forceReload = false);
@@ -9498,6 +9503,54 @@ void updateDiagnosticsIfVisible() {
 // Setup / loop
 // =====================================================
 
+// ---- Crash recorder ----
+// RTC slow memory survives a panic reset (not a power cut), so the next boot
+// can write what the chip was doing when it died into the activity log,
+// instead of Diagnostics saying only "Crash (panic)". Enabled by build.yml,
+// which compiles with -DPANEL_CRASH_NOTE and links with
+// -Wl,--wrap=esp_panic_handler: the system calls __wrap_ first, it notes the
+// facts and hands over to the real handler. A build without the flag simply
+// has no recorder.
+struct CrashNote { uint32_t magic; uint32_t pc; uint32_t ra; int core; char reason[40]; char desc[88]; };
+RTC_NOINIT_ATTR static CrashNote crashNote;
+static const uint32_t CRASH_NOTE_MAGIC = 0xC0FFEE42;
+
+#ifdef PANEL_CRASH_NOTE
+// Leading fields of the system's panic_info_t (IDF 4.4), which is all that is read.
+struct PanelPanicInfo {
+  int core; int exception; const char *reason; const char *description;
+  void *details; void *state; const void *addr; const void *frame; bool pseudo_excause;
+};
+static inline void crashCopy(char *dst, const char *src, size_t n) {
+  size_t i = 0;
+  if (src) for (; i < n - 1 && src[i]; i++) dst[i] = src[i];
+  dst[i] = '\0';
+}
+extern "C" void IRAM_ATTR __wrap_esp_panic_handler(PanelPanicInfo *info) {
+  crashNote.magic = CRASH_NOTE_MAGIC;
+  crashNote.core  = info->core;
+  crashNote.pc    = (uint32_t)info->addr;
+  // Exception frame layout (xtensa_context.h): exit, pc, ps, a0 -- a0 is the
+  // return address, i.e. the caller of the function that faulted.
+  crashNote.ra    = info->frame ? ((const uint32_t *)info->frame)[3] : 0;
+  crashCopy(crashNote.reason, info->reason, sizeof(crashNote.reason));
+  crashCopy(crashNote.desc, info->description, sizeof(crashNote.desc));
+  __real_esp_panic_handler(info);
+}
+#endif
+
+// Boot: if the last reset was a recorded crash, put it in the log. The two
+// addresses resolve to function names with firmware/symbols.txt.gz from the
+// same build (the Action publishes it beside latest.bin).
+static void reportCrashNote() {
+  if (crashNote.magic != CRASH_NOTE_MAGIC) return;
+  crashNote.magic = 0;
+  char d[200];
+  snprintf(d, sizeof(d), "core %d %s PC %08x RA %08x %s",
+           crashNote.core, crashNote.reason, (unsigned)crashNote.pc, (unsigned)crashNote.ra, crashNote.desc);
+  logActivityEvent("CRASH", d);
+}
+
 // Boot: say what became of an update that was in flight at the last reset.
 static void reportInterruptedUpdate() {
   prefs.begin("doorpanel", true);
@@ -9541,6 +9594,7 @@ void setup() {
 
   initSDCard();
   cleanupSdUpdateAfterSuccessfulBoot();
+  reportCrashNote();
   reportInterruptedUpdate();
 
   // ---- Boot-attempt counter ----
