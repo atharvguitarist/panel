@@ -129,6 +129,13 @@
   .primary:active { background: var(--wine-dark); }
   .primary.confirm { background: var(--wine-dark); }
 
+  .primary-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .primary-row .primary { padding: 30px 12px; font-size: 19px; }
+  /* Lights On: the warm, lit counterpart to the burgundy Off. */
+  .primary.on { background: #C9A85C; color: #3D2A08; box-shadow: 0 6px 18px rgba(201,168,92,.32); }
+  .primary.on:active { background: #B8963F; }
+  .primary.on.sent { background: #E3C77A; }
+
   .grid {
     margin-top: 14px;
     display: grid;
@@ -455,7 +462,10 @@
     <button class="later" id="install-later" aria-label="Not now">&times;</button>
   </div>
 
-  <button class="primary" id="btn-off">All Lights Off</button>
+  <div class="primary-row">
+    <button class="primary on" id="btn-on">Lights On</button>
+    <button class="primary" id="btn-off">All Lights Off</button>
+  </div>
 
   <div class="grid">
     <button class="secondary" id="btn-status">Check Status</button>
@@ -725,11 +735,16 @@
       .catch(function () { return []; });
   }
 
+  // A reply from the panel: titled "Panel" (5.6.18 and later) or, from
+  // older firmware, prefixed with a checkmark.
+  function isReply(m) { return m.title === "Panel" || m.message.indexOf(MARK) === 0; }
+  function replyText(m) { return m.message.indexOf(MARK) === 0 ? m.message.slice(MARK.length) : m.message; }
+
   // Replies the panel posted at or after `since` (unix seconds), oldest first.
   function panelReplies(since) {
     return pollTopic(MAIN_URL, since).then(function (list) {
-      return list.filter(function (m) { return m.message.indexOf(MARK) === 0 && m.time >= since; })
-                 .map(function (m) { m.message = m.message.slice(MARK.length); return m; });
+      return list.filter(function (m) { return isReply(m) && m.time >= since; })
+                 .map(function (m) { m.message = replyText(m); return m; });
     });
   }
 
@@ -830,6 +845,10 @@
     var armed = false;
 
     btn.addEventListener("click", function () {
+      if (cmd === "on" && link.running() && !link.atLeast("5.6.18")) {
+        say("Lights On needs panel update 5.6.18 \u2014 tap Update above.", true, 6000);
+        return;
+      }
       if (btn.dataset.confirm && !armed) {
         armed = true;
         btn.textContent = "Tap again to confirm";
@@ -848,6 +867,7 @@
     });
   }
 
+  wire("btn-on",      "on");
   wire("btn-off",     "off");
   wire("btn-status",  "status");
   wire("btn-restart", "restart");
@@ -968,7 +988,7 @@
             else if (/downloaded\. Installing/.test(t))     { seenInstall = true; stage("Updating to " + target, "Downloaded and verified. Installing — the panel restarts itself; back in about a minute.", bar(3)); }
             else if (/^Update failed/.test(t))              { fail(t.replace(/^Update failed:\s*/, "")); seenInstall = "fail"; }
             else if (/^Already up to date/.test(t))         { mode = ""; text.innerHTML = "<strong>Already up to date</strong><br>" + t; steps.textContent = ""; show("done"); seenInstall = "done"; }
-            else if (/^No WiFi|^SD card/.test(t))           { fail(t); seenInstall = "fail"; }
+            else if (/^No Wi-?Fi|^SD card/.test(t))         { fail(t); seenInstall = "fail"; }
           });
           if (seenInstall === "fail" || seenInstall === "done") return;
           if (!seenInstall) return setTimeout(follow, 2500);
@@ -1017,7 +1037,9 @@
 
     return {
       check: function () { if (mode !== "updating") { clearTimeout(retryTimer); check(); } },
-      online: function () { if (mode === "offline") { clearTimeout(retryTimer); check(); } }
+      online: function () { if (mode === "offline") { clearTimeout(retryTimer); check(); } },
+      running: function () { return running; },
+      atLeast: function (v) { return !!running && !newer(v, running); }
     };
   })();
 
@@ -1047,8 +1069,8 @@
           return;
         }
         list.innerHTML = msgs.map(function (m) {
-          var ok = m.message.indexOf(MARK) === 0;
-          var body = ok ? m.message.slice(MARK.length) : m.message;
+          var ok = isReply(m);
+          var body = replyText(m);
           var title = ok ? "" : (m.title ? "<em>" + esc(m.title) + " &middot; </em>" : "");
           return '<div class="log-row' + (ok ? " ok" : "") + '"><div class="log-time">' + hhmm(m.time) +
                  '</div><div class="log-text">' + title + esc(body) + '</div></div>';
