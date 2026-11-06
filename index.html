@@ -76,8 +76,9 @@
 
   body {
     min-height: 100svh;
-    padding: max(28px, env(safe-area-inset-top)) 20px
-             max(28px, env(safe-area-inset-bottom));
+    /* Full-screen on iPhone draws under the status bar; clear it, then breathe. */
+    padding: calc(env(safe-area-inset-top, 0px) + 28px) 20px
+             calc(env(safe-area-inset-bottom, 0px) + 28px);
     display: flex;
     justify-content: center;
   }
@@ -255,6 +256,15 @@
     color: #9A9387;
   }
 
+  .relink {
+    display: inline-block;
+    margin-top: 10px;
+    padding: 6px 10px;
+    color: var(--gold-text);
+    text-decoration: underline;
+    text-underline-offset: 3px;
+  }
+
   /* ---- Add-to-home-screen banner ----
      Only exists while the page is open in a browser tab. Inside the installed
      app it is never rendered. Android gets a real one-tap install (the
@@ -366,7 +376,7 @@
 <div class="wrap" id="wrap">
 
   <header>
-    <h1>Front Door Panel</h1>
+    <h1>Home Panel</h1>
     <div class="topic-badge" id="badge"></div>
   </header>
 
@@ -396,7 +406,7 @@
   <div class="card">
     <h2>Notifications</h2>
     <p>Install the free <strong>ntfy</strong> app and subscribe to the topic
-       below to get an alert when the doorbell rings &mdash; and a confirmation
+       below to get alerts from your panel &mdash; and a confirmation
        whenever you use a button above.</p>
 
     <div class="topic-row">
@@ -410,9 +420,10 @@
     </div>
   </div>
 
-  <footer id="foot">
-    Add this page to your home screen for one-tap access.<br>
-    Commands reach the panel from anywhere.
+  <footer>
+    <span id="foot">Add this page to your home screen for one-tap access.<br>
+    Commands reach the panel from anywhere.</span><br>
+    <a href="#" id="relink" class="relink">Different panel? Re-link</a>
   </footer>
 
 </div>
@@ -493,9 +504,9 @@
     var self = location.origin + location.pathname;
     var manifest = {
       id: self + "#t=" + topic,
-      name: "Front Door Panel",
+      name: "Home Panel",
       short_name: "Panel",
-      description: "Controls for your door panel.",
+      description: "Controls for your home panel.",
       start_url: self + "#t=" + topic,
       scope: base,
       display: "standalone",
@@ -577,6 +588,20 @@
   })();
 
   var CMD_URL = "https://ntfy.sh/" + topic + "-cmd";
+
+  // ---- Re-link ------------------------------------------------------------
+  // A saved topic otherwise sticks forever: if the panel was reset (new
+  // topic) or this phone should drive a different panel, forget it and show
+  // the scan / paste screen. Dropping the fragment matters too -- an installed
+  // app relaunches with the old #t= otherwise.
+  function relink() {
+    try { localStorage.removeItem(STORE_KEY); } catch (e) { /* ignore */ }
+    location.replace(location.pathname);
+  }
+  document.getElementById("relink").addEventListener("click", function (e) {
+    e.preventDefault();
+    relink();
+  });
 
   document.getElementById("badge").textContent      = topic;
   document.getElementById("topic-text").textContent = topic;
@@ -705,7 +730,16 @@
     setTimeout(function () {
       Promise.all([askPanel(), published]).then(function (v) {
         var running = v[0], latest = v[1];
-        if (!running) return;                       // panel offline or older firmware
+        if (!running) {
+          // No answer in ~12 s. Say so instead of letting buttons look dead:
+          // the page can always post, but only a listening panel acts on it.
+          offline = true;
+          text.innerHTML = "<strong>Panel isn't answering</strong><br>Check it is on and connected to Wi-Fi. " +
+                           "If it was reset, re-link it from its Phone setup screen.";
+          btn.textContent = "Re-link";
+          box.classList.add("show");
+          return;
+        }
         badge.textContent = topic + "  \u00b7  v" + running;
         if (!latest || !newer(latest, running)) return;
         text.innerHTML = "<strong>Update available</strong><br>Version " + latest +
@@ -714,8 +748,10 @@
       });
     }, 600);
 
+    var offline = false;
     var armed = false, armTimer = null;
     btn.addEventListener("click", function () {
+      if (offline) { relink(); return; }
       if (!armed) {
         armed = true;
         btn.textContent = "Tap again";
