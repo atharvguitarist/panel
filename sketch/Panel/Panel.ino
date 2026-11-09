@@ -179,7 +179,7 @@ const char* PHONE_UI_BASE_URL = "https://atharvguitarist.github.io/panel/";
 // straight out of the uploaded .bin -- change ONLY the number. FW_VERSION
 // points past the tag, so every existing use is unchanged, and because it is
 // used everywhere the linker can never strip the tag from the binary.
-const char  FW_VERSION_TAG[] = "PANELFW:5.8.0";
+const char  FW_VERSION_TAG[] = "PANELFW:5.8.2";
 const char* FW_VERSION = FW_VERSION_TAG + 8;
 const char* FW_MANIFEST_PATH = "firmware/manifest.json";
 const char* FW_BINARY_PATH   = "firmware/latest.bin";
@@ -699,11 +699,12 @@ bool firmwareUploadPortalActive = false;
 
 // Update-from-GitHub state. Written by the core-0 worker, consumed by loop().
 volatile bool    firmwareDownloadActive = false;  // listener stands down while true
-volatile bool    fwStaging              = false;  // loop() is writing the image to the card: no TLS, no pushes
+volatile bool    fwStaging              = false;  // loop() is flashing the image: no TLS, no pushes
+char             fwDownloadStats[96]     = "";     // "Download: 1286 KB in 48 s, 21 requests, 2 reconnects" for the log
 volatile uint8_t firmwareDownloadPct    = 0;
 volatile uint8_t firmwareUpdateResult   = 0;      // 0 none, see FWR_* below
 char             firmwareUpdateVersion[16] = "";  // version found by check/download
-char             firmwareUpdateMsg[96]     = "";  // human reason on failure
+char             firmwareUpdateMsg[128]    = "";  // human reason on failure
 enum { FWR_NONE = 0, FWR_UP_TO_DATE, FWR_AVAILABLE, FWR_DOWNLOADED, FWR_FAILED };
 // Declared here, above every function: the IDE emits fwFetchManifest()'s
 // auto-prototype at the top of the file, so its return type must exist there.
@@ -878,6 +879,17 @@ bool   phoneSetupPending = false; // show Phone Setup once after provisioning
 // immediate value to use on subsequent boots while a fresh lookup runs.
 String nvsGeoLat = "";
 String nvsGeoLon = "";
+
+// The UI thread's stack. Arduino's default is 8 KB; the deepest thing this
+// task does -- LVGL rendering a screen, then stdio -> VFS -> FatFS -> SD on
+// top of it -- was the likely overrun behind "LoadProhibited in validate()
+// from f_write()" during an update save: a corrupt file object, i.e. the
+// stack had run into the heap. Sixteen is cheap insurance for every path.
+#ifdef SET_LOOP_TASK_STACK_SIZE
+SET_LOOP_TASK_STACK_SIZE(16 * 1024);
+#else
+size_t getArduinoLoopTaskStackSize(void) { return 16 * 1024; }
+#endif
 
 void loadSavedSettings() {
   prefs.begin("doorpanel", false);
@@ -5104,12 +5116,12 @@ static void updateHealthLog() {
 
   unsigned stackFree = remoteTaskHandle
       ? (unsigned)uxTaskGetStackHighWaterMark(remoteTaskHandle) : 0;
-  char d[110];
-  snprintf(d, sizeof(d), "heap %uK min %uK blk %uK|stk %u|pcf %s r%u|i2c %u tch %u|link %u|wifi %u|push %u/%u(%d)",
+  char d[120];
+  snprintf(d, sizeof(d), "heap %uK min %uK blk %uK|stk %u lstk %u|pcf %s r%u|i2c %u tch %u|link %u|wifi %u|push %u/%u(%d)",
            (unsigned)(ESP.getFreeHeap() / 1024),
            (unsigned)(ESP.getMinFreeHeap() / 1024),
            (unsigned)(ESP.getMaxAllocHeap() / 1024),
-           stackFree,
+           stackFree, (unsigned)uxTaskGetStackHighWaterMark(NULL),
            pcfOnline ? "ok" : "FAIL", (unsigned)pcfStateRestores,
            (unsigned)i2cResetCount, (unsigned)touchRejectCount,
            (unsigned)statListenerReconnects, (unsigned)statWifiReconnects,
@@ -5342,76 +5354,97 @@ static void fwUpgradeTask(void *param) {
     snprintf(url + L, sizeof(url) - L, "?v=%s", m.md5[0] ? m.md5 : m.version);
   }
 
-  // RESUMABLE download into PSRAM. A wall panel on weak Wi-Fi will drop a
-  // 1.3MB TLS stream now and then; each attempt asks for the rest of the
-  // file with an HTTP Range header and continues from the last byte held.
-  // If the server ever ignores Range (200 instead of 206), it restarts at 0.
-  //
-  // The budget is progress, not a count: at -78 dBm a link may drop every
-  // 60-70KB, which is twenty-odd resumes for one image, and every one of
-  // them moves forward. We stop only after six attempts in a row that gained
-  // nothing, or fifteen minutes in all. Modem power-save is suspended for
-  // the duration -- on a weak link it is what turns a slow stream into a
-  // dropped one -- and restored afterwards.
+  // RESUMABLE download into PSRAM, in 64 KB Range requests over one kept-
+  // alive TLS connection. A wall panel on weak Wi-Fi cannot hold a 1.3 MB
+  // stream open -- it stalls, and every stall used to cost a 10 s wait plus
+  // a fresh handshake, which is how a download took sixteen minutes. Short
+  // requests bound the damage: a stall loses at most 64 KB of time, the
+  // connection is reused while it lives, and progress is never thrown away.
+  // The budget is progress, not a count: we stop only after six requests in
+  // a row that gained nothing, or fifteen minutes in all. Modem power-save
+  // is off for the duration and restored afterwards.
+  const size_t CHUNK = 65536;
   const int MAX_IDLE_ATTEMPTS = 6;
   const unsigned long MAX_TOTAL_MS = 15UL * 60UL * 1000UL;
   size_t total = 0;
-  int lastCode = 0, attempts = 0, idle = 0;
+  int lastCode = 0, attempts = 0, idle = 0, reconnects = 0;
   unsigned long startedAt = millis();
   bool sleepWas = WiFi.getSleep();
   WiFi.setSleep(false);
 
+  WiFiClientSecure *client = nullptr;
+  HTTPClient *http = nullptr;
+  auto dropConnection = [&]() {
+    if (http)   { http->end(); delete http; http = nullptr; }
+    if (client) { client->stop(); delete client; client = nullptr; }
+  };
+
   while (total < m.size && idle < MAX_IDLE_ATTEMPTS && millis() - startedAt < MAX_TOTAL_MS) {
     attempts++;
     size_t before = total;
-    if (attempts > 1) vTaskDelay(pdMS_TO_TICKS(2000 + 2000UL * idle));   // 2 s, longer only after dead attempts
-    if (WiFi.status() != WL_CONNECTED) { lastCode = -100; idle++; continue; }
+    if (WiFi.status() != WL_CONNECTED) { lastCode = -100; idle++; dropConnection(); vTaskDelay(pdMS_TO_TICKS(2000)); continue; }
 
-    WiFiClientSecure client;
-    client.setInsecure();
-    HTTPClient http;
-    http.setConnectTimeout(10000);
-    http.setTimeout(15000);
-    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-    if (!http.begin(client, url)) { lastCode = -101; continue; }
-    if (total > 0) {
-      char range[40];
-      snprintf(range, sizeof(range), "bytes=%u-", (unsigned)total);
-      http.addHeader("Range", range);
+    if (!client) {
+      if (attempts > 1) { reconnects++; vTaskDelay(pdMS_TO_TICKS(1500 + 1500UL * idle)); }
+      client = new WiFiClientSecure();
+      client->setInsecure();
+      client->setHandshakeTimeout(12);
+      http = new HTTPClient();
+      http->setConnectTimeout(10000);
+      http->setTimeout(8000);
+      http->setReuse(true);                              // keep the TLS session for the next range
+      http->setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
     }
-    int code = http.GET();
-    lastCode = code;
-    if (code == 200) total = 0;                      // whole file (first try, or Range ignored)
-    if (code != 200 && code != 206) { http.end(); idle++; continue; }
+    // begin() per request: it resets the header list (so Range does not pile
+    // up) and keeps the connection when the host is unchanged.
+    if (!http->begin(*client, url)) { lastCode = -101; idle++; dropConnection(); continue; }
 
-    WiFiClient *stream = http.getStreamPtr();
+    size_t want = m.size - total;
+    if (want > CHUNK) want = CHUNK;
+    char range[48];
+    snprintf(range, sizeof(range), "bytes=%u-%u", (unsigned)total, (unsigned)(total + want - 1));
+    http->addHeader("Range", range);
+    int code = http->GET();
+    lastCode = code;
+    if (code == 200) total = 0;                          // Range ignored: whole file from the start
+    if (code != 200 && code != 206) { idle++; dropConnection(); continue; }
+
+    WiFiClient *stream = http->getStreamPtr();
+    size_t expect = (code == 206) ? want : m.size;
+    size_t got = 0;
     unsigned long lastDataAt = millis();
-    while (total < m.size && http.connected()) {
+    while (got < expect && total < m.size) {
       size_t avail = stream->available();
       if (avail) {
-        size_t want = m.size - total;
-        if (want > avail) want = avail;
-        if (want > 4096)  want = 4096;
-        int n = stream->readBytes(img + total, want);
-        if (n <= 0) break;
-        total += n;
+        size_t n = expect - got;
+        if (n > avail)  n = avail;
+        if (n > 16384)  n = 16384;
+        int r = stream->readBytes(img + total, n);
+        if (r <= 0) break;
+        total += r; got += r;
         firmwareDownloadPct = (uint8_t)((total * 100ULL) / m.size);
         lastDataAt = millis();
       } else {
-        if (millis() - lastDataAt > 10000UL) break;   // stalled: reconnect and resume
-        vTaskDelay(pdMS_TO_TICKS(5));
+        if (!http->connected() && stream->available() == 0) break;
+        if (millis() - lastDataAt > 6000UL) break;      // stalled: drop and ask again
+        vTaskDelay(pdMS_TO_TICKS(2));
       }
     }
-    http.end();
+    if (got < expect) dropConnection();                  // short or stalled: fresh connection next time
+    else http->end();                                    // request done; the TLS session stays for the next one
     idle = (total > before) ? 0 : idle + 1;
   }
+  dropConnection();
   WiFi.setSleep(sleepWas);
   xSemaphoreGive(tlsGate);   // network part is over; verification needs no TLS
 
+  snprintf(fwDownloadStats, sizeof(fwDownloadStats), "Download: %u KB in %lu s, %d requests, %d reconnects",
+           (unsigned)(total / 1024), (millis() - startedAt) / 1000UL, attempts, reconnects);
+
   if (total != m.size) {
     free(img);
-    snprintf(firmwareUpdateMsg, sizeof(firmwareUpdateMsg), "Download incomplete (%u of %u bytes, %d tries in %lu min, last code %d)",
-             (unsigned)total, (unsigned)m.size, attempts, (millis() - startedAt) / 60000UL, lastCode);
+    snprintf(firmwareUpdateMsg, sizeof(firmwareUpdateMsg), "Download incomplete (%u of %u bytes, %d requests, %d reconnects, %lu min, code %d)",
+             (unsigned)total, (unsigned)m.size, attempts, reconnects, (millis() - startedAt) / 60000UL, lastCode);
     firmwareUpdateResult = FWR_FAILED; firmwareDownloadActive = false; vTaskDelete(nullptr); return;
   }
 
@@ -5456,74 +5489,35 @@ static void fwStageMark(uint8_t stage) {
   prefs.end();
 }
 
-// UI thread: write the verified image to the card, read it back and check
-// it, then stage it for the boot-time installer. Takes a couple of seconds;
-// the screen says so. Returns false with firmwareUpdateMsg set on failure.
-static bool fwWriteStagedImageToSd() {
-  const char *tmpPath = "/update/firmware.tmp";
+// UI thread: flash the verified image into the other OTA slot, straight from
+// PSRAM, and mark it bootable. The radio side is quiet (fwStaging) and the
+// backlight is off while the cache is being disabled for flash writes -- the
+// same discipline as the boot-time SD installer, minus the card. 4 KB chunks;
+// Update copies each into its own internal-RAM buffer before writing.
+static bool fwFlashStagedImage() {
+  if (!fwStagedBuf || !fwStagedLen) { snprintf(firmwareUpdateMsg, sizeof(firmwareUpdateMsg), "Nothing to install"); return false; }
   bool ok = false;
-  uint8_t *rb = nullptr;
-  if (!fwStagedBuf || !fwStagedLen) { snprintf(firmwareUpdateMsg, sizeof(firmwareUpdateMsg), "Nothing to stage"); return false; }
-  if (!sdMounted) { snprintf(firmwareUpdateMsg, sizeof(firmwareUpdateMsg), "SD card not ready"); goto done; }
-
-  {
-    if (!SD.exists("/update")) SD.mkdir("/update");
-    SD.remove(tmpPath);
-    File f = SD.open(tmpPath, FILE_WRITE);
-    if (!f) { snprintf(firmwareUpdateMsg, sizeof(firmwareUpdateMsg), "SD card not writable"); goto done; }
+  if (!Update.begin(fwStagedLen, U_FLASH)) {
+    snprintf(firmwareUpdateMsg, sizeof(firmwareUpdateMsg), "Flash not ready: %s", Update.errorString());
+  } else {
     size_t off = 0;
-    unsigned chunks = 0;
     while (off < fwStagedLen) {
       size_t n = fwStagedLen - off;
-      if (n > 8192) n = 8192;
-      if (f.write(fwStagedBuf + off, n) != n) break;
+      if (n > 4096) n = 4096;
+      if (Update.write(fwStagedBuf + off, n) != n) {
+        snprintf(firmwareUpdateMsg, sizeof(firmwareUpdateMsg), "Flash write failed at %u: %s", (unsigned)off, Update.errorString());
+        break;
+      }
       off += n;
-      if ((++chunks & 7) == 0) vTaskDelay(1);   // let the idle task and Wi-Fi stack breathe
+      if ((off & 0xFFFF) == 0) vTaskDelay(1);   // every 64 KB: let the idle task breathe
     }
-    f.close();
-    if (off != fwStagedLen) {
-      snprintf(firmwareUpdateMsg, sizeof(firmwareUpdateMsg), "SD card write failed at %u of %u bytes",
-               (unsigned)off, (unsigned)fwStagedLen);
-      SD.remove(tmpPath);
-      goto done;
+    if (off == fwStagedLen) {
+      if (Update.end(true)) ok = true;
+      else snprintf(firmwareUpdateMsg, sizeof(firmwareUpdateMsg), "Flash finish failed: %s", Update.errorString());
+    } else {
+      Update.abort();
     }
-
-    // Read back and compare, so a card that silently corrupts writes can
-    // never hand the boot installer a damaged image. 4KB reads from the
-    // internal heap (falls back to a small stack buffer if it is tight).
-    const size_t RB = 4096;
-    rb = (uint8_t *)malloc(RB);
-    uint8_t small[512];
-    uint8_t *chunk = rb ? rb : small;
-    size_t chunkCap = rb ? RB : sizeof(small);
-    File r = SD.open(tmpPath, FILE_READ);
-    bool same = r && r.size() == fwStagedLen;
-    size_t pos = 0;
-    chunks = 0;
-    while (same && pos < fwStagedLen) {
-      int n = r.read(chunk, chunkCap);
-      if (n <= 0 || memcmp(chunk, fwStagedBuf + pos, n) != 0) { same = false; break; }
-      pos += n;
-      if ((++chunks & 15) == 0) vTaskDelay(1);
-    }
-    if (r) r.close();
-    if (!same || pos != fwStagedLen) {
-      snprintf(firmwareUpdateMsg, sizeof(firmwareUpdateMsg), "SD card read-back mismatch -- card may be failing");
-      SD.remove(tmpPath);
-      goto done;
-    }
-
-    SD.remove(SD_UPDATE_FIRMWARE_PATH);
-    if (!SD.rename(tmpPath, SD_UPDATE_FIRMWARE_PATH)) {
-      snprintf(firmwareUpdateMsg, sizeof(firmwareUpdateMsg), "Could not stage firmware on SD");
-      SD.remove(tmpPath);
-      goto done;
-    }
-    ok = true;
   }
-
-done:
-  if (rb) free(rb);
   free(fwStagedBuf);
   fwStagedBuf = nullptr;
   fwStagedLen = 0;
@@ -5544,7 +5538,7 @@ void startFirmwareUpgrade() {
   showFirmwarePortalScreen("", "Downloading update...", "Keep power on.");
   logActivityEvent("UPDATE", "Download started");
   sendRemoteReply("Downloading the update. I'll restart to install it.");
-  xTaskCreatePinnedToCore(fwUpgradeTask, "fwUpgrade", 12288, nullptr, 1, nullptr, 0);
+  xTaskCreatePinnedToCore(fwUpgradeTask, "fwUpgrade", 12288, nullptr, 2, nullptr, 0);
 }
 
 void startFirmwareUpdateCheck() {
@@ -5685,15 +5679,20 @@ static void processFirmwareUpdateResults() {
       showFirmwarePortalScreen("", "Update failed", firmwareUpdateMsg);
       break;
     case FWR_DOWNLOADED: {
-      showFirmwarePortalScreen("", "Saving update...", "Keep power on.");
-      lv_timer_handler();                      // show it before the card write blocks
-      logActivityEvent("UPDATE", "Saving to card");
-      fwStageMark(1);
+      if (fwDownloadStats[0]) logActivityEvent("UPDATE", fwDownloadStats);
+      snprintf(msg, sizeof(msg), "Downloaded %s, installing", firmwareUpdateVersion);
+      logActivityEvent("UPDATE", msg);
+      showFirmwarePortalScreen("", "Installing update...", "Screen will turn off for a moment. Keep power on.");
+      lv_timer_handler();                      // show it before the flash writes begin
+      fwStageMark(4);
       fwStaging = true;                        // radio side stands down for the write
       vTaskDelay(pdMS_TO_TICKS(600));          // let any TLS already in flight finish first
-      bool staged = fwWriteStagedImageToSd();
+      uint8_t bl = getSelectedBrightness();
+      setBacklight(0);                         // flash writes disable the cache; hide the display glitch
+      bool flashed = fwFlashStagedImage();
+      setBacklight(bl);
       fwStaging = false;
-      if (!staged) {
+      if (!flashed) {
         fwStageMark(0);
         snprintf(msg, sizeof(msg), "Update failed: %s", firmwareUpdateMsg);
         logActivityEvent("UPDATE", msg);
@@ -5702,13 +5701,11 @@ static void processFirmwareUpdateResults() {
         snprintf(fwCheckSummary, sizeof(fwCheckSummary), "Last attempt failed");
         break;
       }
-      fwStageMark(2);
-      snprintf(msg, sizeof(msg), "Downloaded %s, installing", firmwareUpdateVersion);
-      logActivityEvent("UPDATE", msg);
-      snprintf(msg, sizeof(msg), "Update %s downloaded. Installing now, back in about a minute.",
+      fwStageMark(5);
+      snprintf(msg, sizeof(msg), "Update %s installed. Restarting, back in about half a minute.",
                firmwareUpdateVersion);
       sendRemoteReply(msg);
-      showFirmwarePortalScreen("", "Update downloaded", "Restarting to install. Keep power on.");
+      showFirmwarePortalScreen("", "Update installed", "Restarting. Keep power on.");
       pendingRemoteRestartAt = millis() + 2500;   // let the reply leave first
       break;
     }
@@ -5814,7 +5811,7 @@ static void processRemoteCommand() {
     if (dueSince == 0) dueSince = millis();
     bool quiet = uxQueueMessagesWaiting(pushQueue) == 0 && xSemaphoreTake(tlsGate, 0) == pdTRUE;
     if (quiet || millis() - dueSince > 9000UL) {
-      if (fwStagedBuf == nullptr && SD.exists(SD_UPDATE_FIRMWARE_PATH)) fwStageMark(3);
+      /* the installer has already marked stage 5; nothing to add here */
       delay(200);
       ESP.restart();
     }
@@ -9643,6 +9640,49 @@ static void reportCrashNote() {
   logActivityEvent("CRASH", d);
 }
 
+// ---- Boot-loop rollback: the shipped-product safety net ----
+// A firmware that crashes over and over must never need a screwdriver or an
+// SD card: after THREE crash resets in a row, each within 90 seconds of
+// boot, the panel switches itself back to the previous firmware, which is
+// still sitting in the spare OTA slot from the last update. Counting is by
+// reset reason, so power cuts and normal restarts always reset the count to
+// zero, and loop() clears it once the panel has been up for 90 seconds --
+// only a genuine crash loop can ever reach three.
+static void checkBootLoopRollback() {
+  esp_reset_reason_t r = esp_reset_reason();
+  bool crash = (r == ESP_RST_PANIC || r == ESP_RST_INT_WDT ||
+                r == ESP_RST_TASK_WDT || r == ESP_RST_WDT);
+  prefs.begin("doorpanel", false);
+  uint8_t fails = crash ? (uint8_t)(prefs.getUChar("bootfail", 0) + 1) : 0;
+  prefs.putUChar("bootfail", fails);
+  prefs.end();
+  if (fails < 3) return;
+
+  prefs.begin("doorpanel", false);
+  prefs.putUChar("bootfail", 0);              // whatever happens next starts clean
+  prefs.end();
+  if (Update.canRollBack()) {
+    logActivityEvent("UPDATE", "Crash loop - going back to the previous firmware");
+    Update.rollBack();
+    delay(200);
+    ESP.restart();
+  } else {
+    // Nothing valid in the other slot (fresh factory flash): carry on and
+    // leave the trail in the log instead.
+    logActivityEvent("UPDATE", "Crash loop, but no previous firmware to go back to");
+  }
+}
+
+// loop(): after 90 s up, this boot counts as healthy.
+static void bootHealthyTick() {
+  static bool done = false;
+  if (done || millis() < 90000UL) return;
+  done = true;
+  prefs.begin("doorpanel", false);
+  if (prefs.getUChar("bootfail", 0) != 0) prefs.putUChar("bootfail", 0);
+  prefs.end();
+}
+
 // Boot: say what became of an update that was in flight at the last reset.
 static void reportInterruptedUpdate() {
   prefs.begin("doorpanel", true);
@@ -9685,9 +9725,19 @@ void setup() {
   lv_init();
 
   initSDCard();
+  // The clock keeps running through a software reset, so the boot report
+  // lines below carry a real time -- set the zone first or they are in UTC.
+  {
+    long off = -GMT_OFFSET_SEC;                 // POSIX TZ sign is inverted
+    char tz[20];
+    snprintf(tz, sizeof(tz), "UTC%c%ld:%02ld", off < 0 ? '-' : '+', labs(off) / 3600, (labs(off) % 3600) / 60);
+    setenv("TZ", tz, 1);
+    tzset();
+  }
   cleanupSdUpdateAfterSuccessfulBoot();
   reportCrashNote();
   reportInterruptedUpdate();
+  checkBootLoopRollback();
 
   // ---- Boot-attempt counter ----
   // Counts setup() calls that never reach markBootSuccessful() at the end of
@@ -9852,6 +9902,7 @@ void loop() {
   updateFirmwareUpdateCheck();
   updateHealthLog();
   updateLogRetention();
+  bootHealthyTick();
   updateSwitchDriverWatch();
   updateWeatherTicker();
   updateBacklightFade();

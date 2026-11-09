@@ -163,15 +163,15 @@ sequenceDiagram
     U->>P: Update
     P->>A: Download latest.bin (resumable)
     P->>P: Verify size + MD5 in RAM
-    P->>P: Stage on SD, read back, restart
-    P->>P: Boot installer flashes, reboots into new version
+    P->>P: Flash the spare OTA slot (radio quiet, backlight off)
+    P->>P: Restart into the new version
 ```
 
 | Safeguard | Why it exists |
 |---|---|
-| **Resumable download** | A wall panel on weak Wi-Fi drops a 1.3 MB stream now and then; each retry continues from the last byte |
-| **Verified twice** | Size and MD5 in RAM, then a byte-for-byte read-back from the SD card |
-| **Install at boot** | Flashing happens before Wi-Fi or the UI start, so nothing competes for the chip |
+| **Resumable download** | 64 KB range requests over a kept-alive connection; a stall costs seconds, not the download, and progress is never thrown away |
+| **Verified before flashing** | Size and MD5 checked in RAM; nothing is written unless both match |
+| **Quiet install** | Notifications and the command link stand down and the backlight goes off while the spare OTA slot is written |
 | **SD fallback** | Copy `latest.bin` to `/update/firmware.bin` and power-cycle — works with no network at all |
 | **Local upload portal** | A five-minute, home-Wi-Fi-only page for dropping in a `.bin` by hand |
 | **Crash recorder** | A panic is written to the activity log on the next boot, with an address that resolves to a function name |
