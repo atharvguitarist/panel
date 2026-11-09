@@ -136,6 +136,13 @@
   .lights {
     display: grid; grid-template-columns: 1fr 1fr; gap: 12px;
   }
+  .lights.dense { grid-template-columns: 1fr 1fr 1fr; gap: 10px; }
+  .lights.dense .light { padding: 11px 8px 9px; gap: 6px; }
+  .lights.dense .light .name { font-size: 13px; }
+  .lights.dense .sw { width: 44px; height: 26px; }
+  .lights.dense .sw::after { width: 20px; height: 20px; }
+  .lights.dense .sw.on::after { transform: translateX(18px); }
+  .lights.dense .light .mode { font-size: 10px; }
   .light {
     background: var(--card);
     border: 1px solid var(--line);
@@ -524,20 +531,9 @@
     <button class="later" id="install-later" aria-label="Not now">&times;</button>
   </div>
 
-  <div class="lights">
-    <div class="light" id="light-1">
-      <button class="name" id="name-1" title="Tap to rename">Light 1</button>
-      <button class="sw" id="sw-1" aria-label="Light 1" disabled></button>
-      <div class="mode" id="mode-1">&nbsp;</div>
-    </div>
-    <div class="light" id="light-2">
-      <button class="name" id="name-2" title="Tap to rename">Light 2</button>
-      <button class="sw" id="sw-2" aria-label="Light 2" disabled></button>
-      <div class="mode" id="mode-2">&nbsp;</div>
-    </div>
-  </div>
+  <div class="lights" id="lights"></div>
   <div class="lights-note" id="lights-note"></div>
-  <button class="primary wide" id="btn-off">All Lights Off</button>
+  <button class="primary wide" id="btn-off">All Off</button>
 
   <div class="grid">
     <button class="secondary" id="btn-status">Check Status</button>
@@ -858,7 +854,7 @@
   function parseState(text) {
     var m = /^(\d+\.\d+\.\d+)(?:\|(.*))?$/.exec(text);
     if (!m) return null;
-    var st = { version: m[1], lights: null };
+    var st = { version: m[1], lights: null, raw: text };
     if (m[2]) {
       var parts = m[2].split("|"), lights = [];
       for (var i = 0; i < parts.length; i++) {
@@ -866,7 +862,7 @@
         if (!p) return null;
         lights.push({ name: p[1], on: p[2] === "1", tag: p[3] || "" });
       }
-      if (lights.length === 2) st.lights = lights;
+      if (lights.length >= 1 && lights.length <= 8) st.lights = lights;
     }
     return st;
   }
@@ -976,38 +972,53 @@
   // askVersion). A switch is optimistic -- it flips at once, the command goes
   // out, and the panel's confirmation settles it; no answer flips it back.
   var lights = (function () {
-    var note = document.getElementById("lights-note");
-    var els = [1, 2].map(function (i) {
-      return {
-        box: document.getElementById("light-" + i), name: document.getElementById("name-" + i),
-        sw: document.getElementById("sw-" + i), mode: document.getElementById("mode-" + i), known: false
-      };
-    });
-    var names = ["Light 1", "Light 2"];
+    var grid = document.getElementById("lights"), note = document.getElementById("lights-note");
+    var els = [], names = [];
+    var CACHE_KEY = "panel.lights";   // last state line, so the cards appear at once on the next open
 
-    function esc(t) { return String(t).replace(/[&<>]/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]; }); }
+    // Build N cards (only when the count changes; otherwise the existing cards are updated in place).
+    function build(n) {
+      if (els.length === n) return;
+      grid.innerHTML = ""; els = [];
+      grid.classList.toggle("dense", n >= 5);
+      for (var i = 0; i < n; i++) (function (i) {
+        var box = document.createElement("div"); box.className = "light";
+        var name = document.createElement("button"); name.className = "name"; name.title = "Tap to rename"; name.textContent = "Light " + (i + 1);
+        var sw = document.createElement("button"); sw.className = "sw"; sw.disabled = true; sw.setAttribute("aria-label", "Light " + (i + 1));
+        var mode = document.createElement("div"); mode.className = "mode"; mode.innerHTML = "&nbsp;";
+        box.appendChild(name); box.appendChild(sw); box.appendChild(mode); grid.appendChild(box);
+        var e = { box: box, name: name, sw: sw, mode: mode, known: false };
+        els.push(e);
+        sw.addEventListener("click", function () { toggle(i); });
+        name.addEventListener("click", function () { open(i); });
+      })(i);
+    }
 
-    function apply(st) {
+    function apply(st, stale) {
       if (!st.lights) {
         // Older firmware: version only. Lights can't be switched one by one.
+        build(2);
         els.forEach(function (e) { e.sw.disabled = true; e.mode.textContent = "\u00a0"; });
         note.textContent = "Switching lights one by one needs panel update 5.7 \u2014 tap Update below.";
         return;
       }
       note.textContent = "";
+      build(st.lights.length);
       st.lights.forEach(function (L, i) {
         var e = els[i];
         names[i] = L.name;
         e.name.textContent = L.name;
         e.sw.setAttribute("aria-label", L.name);
-        e.sw.disabled = false; e.known = true;
+        e.sw.disabled = !!stale; e.known = !stale;
         e.sw.classList.remove("busy");
         e.sw.classList.toggle("on", L.on);
         e.box.classList.toggle("on", L.on);
-        e.mode.textContent = L.tag === "auto" ? "Auto \u00b7 " + (L.on ? "on" : "off")
+        e.mode.textContent = stale ? "\u2026"
+                           : L.tag === "auto" ? "Auto \u00b7 " + (L.on ? "on" : "off")
                            : L.tag === "manual" ? (L.on ? "On until you switch it off" : "Off \u00b7 manual")
                            : (L.on ? "On" : "Off");
       });
+      if (!stale) { try { localStorage.setItem(CACHE_KEY, st.raw || ""); } catch (e) { /* private mode */ } }
     }
 
     // Re-read the state a moment after any command, so a change the panel
@@ -1018,33 +1029,32 @@
       refreshTimer = setTimeout(function () { askVersion(10000); }, 1200);
     }
 
-    els.forEach(function (e, i) {
-      e.sw.addEventListener("click", function () {
-        if (e.sw.disabled || e.sw.classList.contains("busy")) return;
-        var turnOn = !e.sw.classList.contains("on");
-        e.sw.classList.add("busy");
-        e.sw.classList.toggle("on", turnOn);
-        e.box.classList.toggle("on", turnOn);
-        e.mode.textContent = turnOn ? "Switching on\u2026" : "Switching off\u2026";
-        var since = nowSec() - 1, cmd = (turnOn ? "on " : "off ") + (i + 1);
-        fetch(CMD_URL, { method: "POST", body: cmd, mode: "no-cors" }).catch(function () {})
-          .then(function () { return waitReply(since, 18000); })
-          .then(function (reply) {
-            if (reply) { say(reply, false, 7000); tick(e.sw, ""); link.online(); refresh(); }
-            else {
-              say("No confirmation from the panel \u2014 it may be reconnecting.", true, 8000);
-              if (lastState) apply(lastState);   // back to what we last knew
-              link.check();
-            }
-          });
-      });
-    });
+    function toggle(i) {
+      var e = els[i];
+      if (!e || e.sw.disabled || e.sw.classList.contains("busy")) return;
+      var turnOn = !e.sw.classList.contains("on");
+      e.sw.classList.add("busy");
+      e.sw.classList.toggle("on", turnOn);
+      e.box.classList.toggle("on", turnOn);
+      e.mode.textContent = turnOn ? "Switching on\u2026" : "Switching off\u2026";
+      var since = nowSec() - 1, cmd = (turnOn ? "on " : "off ") + (i + 1);
+      fetch(CMD_URL, { method: "POST", body: cmd, mode: "no-cors" }).catch(function () {})
+        .then(function () { return waitReply(since, 18000); })
+        .then(function (reply) {
+          if (reply) { say(reply, false, 7000); tick(e.sw, ""); link.online(); refresh(); }
+          else {
+            say("No confirmation from the panel \u2014 it may be reconnecting.", true, 8000);
+            if (lastState) apply(lastState);   // back to what we last knew
+            link.check();
+          }
+        });
+    }
 
     // ---- Rename ----
     var sheet = document.getElementById("rename-sheet"), bg = document.getElementById("sheet-bg");
     var input = document.getElementById("rename-input"), which = 0;
     function open(i) {
-      if (!els[i].known) { say("Renaming needs panel update 5.7.", true, 5000); return; }
+      if (!els[i] || !els[i].known) { say("Renaming needs the panel to answer first.", true, 5000); return; }
       which = i;
       input.value = names[i];
       sheet.classList.add("open"); bg.classList.add("open");
@@ -1067,12 +1077,17 @@
           else { say(reply || "No confirmation from the panel. The name was not changed.", true, 8000); e.name.textContent = names[which]; }
         });
     }
-    els.forEach(function (e, i) { e.name.addEventListener("click", function () { open(i); }); });
     document.getElementById("rename-close").addEventListener("click", close);
     document.getElementById("rename-cancel").addEventListener("click", close);
     document.getElementById("rename-save").addEventListener("click", save);
     input.addEventListener("keydown", function (ev) { if (ev.key === "Enter") { ev.preventDefault(); save(); } });
     bg.addEventListener("click", close);
+
+    // Cards straight away from the last known state (greyed until the panel
+    // confirms), so the page never opens as an empty box.
+    var cached = null;
+    try { cached = parseState(localStorage.getItem(CACHE_KEY) || ""); } catch (e) { /* ignore */ }
+    if (cached && cached.lights) apply(cached, true); else build(2);
 
     // While the page is open, look again every 30 s so a tap on the panel
     // itself shows here within half a minute. Nothing while hidden.

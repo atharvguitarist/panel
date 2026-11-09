@@ -179,7 +179,7 @@ const char* PHONE_UI_BASE_URL = "https://atharvguitarist.github.io/panel/";
 // straight out of the uploaded .bin -- change ONLY the number. FW_VERSION
 // points past the tag, so every existing use is unchanged, and because it is
 // used everywhere the linker can never strip the tag from the binary.
-const char  FW_VERSION_TAG[] = "PANELFW:5.7.2";
+const char  FW_VERSION_TAG[] = "PANELFW:5.8.0";
 const char* FW_VERSION = FW_VERSION_TAG + 8;
 const char* FW_MANIFEST_PATH = "firmware/manifest.json";
 const char* FW_BINARY_PATH   = "firmware/latest.bin";
@@ -364,7 +364,6 @@ uint8_t pcfState = 0xFF;
 
 Preferences prefs;
 
-bool ceilingState = false;
 
 enum AutoMode {
   AUTO_MODE_AUTO,
@@ -373,24 +372,48 @@ enum AutoMode {
 };
 
 AutoMode autoMode = AUTO_MODE_AUTO;
-bool panelOutputState = false;
 unsigned long autoManualOffStartedAt = 0;
 
 // Which physical light motion detection actually drives. Change this from
 // Settings > Motion > "Motion controls" any time -- no re-flash needed.
 // The other light simply becomes a plain manual on/off tile.
-enum AutoLightTarget {
-  AUTO_TARGET_CEILING,
-  AUTO_TARGET_PANEL
-};
-
-// Light names: shown on the tiles, in Settings, in notifications and on the
-// phone page. Renamed from the phone ("name 1 Porch Light"); kept in NVS.
+// ---- Outputs ----
+// Every switched output is one record: its name (shown on the tile, in
+// Settings, in notifications and on the phone page; renamed from the phone
+// with "name 1 Porch Light"; kept in NVS as name1..nameN), its relay-chip
+// pin, its state, and the LVGL objects of its tile. outputs[0] is the ceiling
+// relay and outputs[1] the wall relay, so "on 1" / "on 2" and the stored
+// autoTgt byte mean the same as they always did. How many there are and
+// whether this panel has a doorbell tile come from NVS ("nout", "bell"),
+// defaulting to 2 + bell: a panel updated from 5.7 is unchanged.
 // 14 characters fits the tile label (205px at FONT_26) and the Settings value.
 const size_t LIGHT_NAME_MAX = 14;
-char lightName1[LIGHT_NAME_MAX + 1] = "Ceiling Glow";   // output 1: ceiling relay
-char lightName2[LIGHT_NAME_MAX + 1] = "Wall Accent";    // output 2: wall / panel relay
-AutoLightTarget autoLightTarget = AUTO_TARGET_CEILING; // "Motion controls" — Settings > Motion, persisted in NVS
+#define MAX_OUTPUTS 8
+struct Output {
+  char      name[LIGHT_NAME_MAX + 1];
+  uint8_t   pin;                 // PCF8574 pin
+  bool      on;
+  lv_obj_t *tile, *label, *dot, *badge, *press, *glow[2];
+  bool      glowShown;           // what the glow animation last settled on
+  lv_img_dsc_t iconDsc;
+  uint8_t  *iconBuf;
+};
+Output  outputs[MAX_OUTPUTS] = {          // names and pins here are the defaults; NVS overrides at boot
+  { "Ceiling Glow", PCF_CEILING_PIN }, { "Wall Accent", PCF_PANEL_PIN }, { "Light 3", PCF_SPARE_PIN },
+  { "Light 4", 4 }, { "Light 5", 5 }, { "Light 6", 6 }, { "Light 7", 7 }, { "Light 8", 0 } };
+uint8_t outputCount  = 2;      // 1..MAX_OUTPUTS
+uint8_t motionTarget = 0;      // index of the output the motion sensor drives ("Motion controls")
+bool    bellPresent  = true;   // doorbell tile on the main screen
+// Pin order for outputs 1..8: ceiling relay, wall relay, then the spare and
+// the free pins. The chime stays on PCF_DOORBELL_PIN whatever the count.
+static const uint8_t OUTPUT_PINS[MAX_OUTPUTS] = { PCF_CEILING_PIN, PCF_PANEL_PIN, PCF_SPARE_PIN, 4, 5, 6, 7, 0 };
+static const char *const OUTPUT_DEFAULT_NAMES[MAX_OUTPUTS] =
+  { "Ceiling Glow", "Wall Accent", "Light 3", "Light 4", "Light 5", "Light 6", "Light 7", "Light 8" };
+// Tile decor and layout records (defined here, above the first function, so
+// the IDE's generated prototypes can name them). Used by the tile code.
+struct TileGlow  { int16_t x, y, w, h, r; uint8_t opaOn; uint32_t c1, c2; bool shadow; uint8_t shOpa; };
+struct TileDecor { const char *icon; int16_t ix, iy; uint16_t iw, ih; TileGlow glow[2]; int16_t lx, lyFromBottom; uint32_t glyphColor; };
+struct TileRect  { int16_t x, y, w, h; };
 
 bool doorbellActive = false;
 unsigned long doorbellStartedAt = 0;
@@ -645,11 +668,6 @@ static lv_obj_t *bellIcon;
 static lv_obj_t *bellWave1;
 static lv_obj_t *bellWave2;
 
-static lv_obj_t *ceilingTile;
-static lv_obj_t *ceilingLabel;
-static lv_obj_t *ceilingGlowLeft = nullptr;
-static lv_obj_t *ceilingGlowRight = nullptr;
-bool ceilingGlowStateShown = false;
 
 static lv_obj_t *weatherIconBox = nullptr;
 static lv_obj_t *weatherIconImage = nullptr;
@@ -660,16 +678,6 @@ char weatherCondition[24] = "--";
 int wmoCode = 0;    // WMO weather code from Open-Meteo, stored directly
 int currentWeatherTemp = 0;
 
-static lv_obj_t *ceilingDot = nullptr;
-static lv_obj_t *panelDot = nullptr;
-static lv_obj_t *ceilingModeBadge = nullptr;
-static lv_obj_t *panelModeBadge = nullptr; // shown instead of ceilingModeBadge when autoLightTarget == AUTO_TARGET_PANEL
-
-static lv_obj_t *panelTile;
-static lv_obj_t *panelLabel;
-static lv_obj_t *panelGlowTop = nullptr;
-static lv_obj_t *panelGlowBottom = nullptr;
-bool panelGlowStateShown = false;
 unsigned long autoManualStartedAt = 0;
 unsigned long lastAutoManualOnReminderAt = 0; // tracks hourly "light left on?" reminders
 
@@ -795,12 +803,8 @@ static uint8_t *bgBuffer = nullptr;
 // /icons/ceiling.rgb565 = 127 x 145 x 2 = 36830 bytes
 // /icons/panel.rgb565   = 96 x 132 x 2 = 25344 bytes
 static lv_img_dsc_t bellIconDsc;
-static lv_img_dsc_t ceilingIconDsc;
-static lv_img_dsc_t panelIconDsc;
 
 static uint8_t *bellIconBuffer = nullptr;
-static uint8_t *ceilingIconBuffer = nullptr;
-static uint8_t *panelIconBuffer = nullptr;
 
 // Bell ring overlay assets.
 // Required optional files:
@@ -827,8 +831,6 @@ bool pcfOnline = false;
 unsigned long lastPcfFailAt = 0;
 
 static lv_obj_t *bellPressOverlay = nullptr;
-static lv_obj_t *ceilingPressOverlay = nullptr;
-static lv_obj_t *panelPressOverlay = nullptr;
 
 // =====================================================
 // "Welcome Home" greeting overlay
@@ -880,10 +882,21 @@ String nvsGeoLon = "";
 void loadSavedSettings() {
   prefs.begin("doorpanel", false);
 
-  prefs.getString("name1", lightName1, sizeof(lightName1));
-  prefs.getString("name2", lightName2, sizeof(lightName2));
-  if (!lightName1[0]) strncpy(lightName1, "Ceiling Glow", sizeof(lightName1) - 1);
-  if (!lightName2[0]) strncpy(lightName2, "Wall Accent",  sizeof(lightName2) - 1);
+  // Outputs: how many, whether there is a doorbell tile, and each one's name.
+  outputCount = prefs.getUChar("nout", 2);
+  if (outputCount < 1 || outputCount > MAX_OUTPUTS) outputCount = 2;
+  bellPresent = prefs.getUChar("bell", 1) != 0;
+  if (outputCount == 8 && bellPresent) outputCount = 7;   // pin 0 is the chime when there is a bell
+  for (uint8_t i = 0; i < MAX_OUTPUTS; i++) {
+    Output &o = outputs[i];
+    o.pin = OUTPUT_PINS[i];
+    o.name[0] = '\0';
+    char key[8];
+    snprintf(key, sizeof(key), "name%u", (unsigned)(i + 1));
+    prefs.getString(key, o.name, sizeof(o.name));
+    if (!o.name[0]) strncpy(o.name, OUTPUT_DEFAULT_NAMES[i], LIGHT_NAME_MAX);
+    o.name[LIGHT_NAME_MAX] = '\0';
+  }
 
   brightnessLevel = prefs.getUChar("brightness", 5); // default Level 6/7
   if (brightnessLevel > 6) {
@@ -910,7 +923,8 @@ void loadSavedSettings() {
   // Which physical light motion detection drives -- "Motion controls" in
   // Settings > Motion. Defaults to Ceiling (0) so existing flashed units
   // keep their current behavior until the user changes it.
-  autoLightTarget = (prefs.getUChar("autoTgt", 0) == 1) ? AUTO_TARGET_PANEL : AUTO_TARGET_CEILING;
+  motionTarget = prefs.getUChar("autoTgt", 0);
+  if (motionTarget >= outputCount) motionTarget = 0;
 
   // WiFi / ntfy: load from NVS; empty string means "use compile-time default"
   // so existing flashed units work without any NVS migration.
@@ -955,7 +969,7 @@ void saveAutoManualOffCooldownMs() {
 
 void saveAutoLightTarget() {
   prefs.begin("doorpanel", false);
-  prefs.putUChar("autoTgt", autoLightTarget == AUTO_TARGET_PANEL ? 1 : 0);
+  prefs.putUChar("autoTgt", motionTarget);
   prefs.end();
 }
 
@@ -1409,8 +1423,8 @@ void pcfScheduleVerify(unsigned long inMs) {
 }
 
 bool pcfVerifyOutputs() {
-  const uint8_t driven = (1 << PCF_DOORBELL_PIN) | (1 << PCF_PANEL_PIN) |
-                         (1 << PCF_CEILING_PIN)  | (1 << PCF_SPARE_PIN);
+  uint8_t driven = bellPresent ? (1 << PCF_DOORBELL_PIN) : 0;
+  for (uint8_t i = 0; i < outputCount; i++) driven |= (1 << outputs[i].pin);
   if (Wire.requestFrom((uint8_t)PCF_ADDR, (uint8_t)1) != 1) return false;
   int rd = Wire.read();
   if (rd < 0) return false;
@@ -1434,12 +1448,7 @@ void allOutputsOff() {
   pcfWriteState();
 
   pcfSetPin(PCF_DOORBELL_PIN, false);
-  pcfSetPin(PCF_CEILING_PIN, false);
-  pcfSetPin(PCF_PANEL_PIN, false);
-  pcfSetPin(PCF_SPARE_PIN, false);
-
-  ceilingState = false;
-  panelOutputState = false;
+  for (uint8_t i = 0; i < outputCount; i++) { outputs[i].on = false; pcfSetPin(outputs[i].pin, false); }
   autoMode = AUTO_MODE_AUTO;
   autoManualStartedAt = 0;
   autoManualOffStartedAt = 0;
@@ -2194,7 +2203,8 @@ void applyClockPillPlacement() {
 
   lv_obj_clear_flag(clockPill, LV_OBJ_FLAG_HIDDEN);
 
-  if (mode == CLOCK_PILL_TOP_RIGHT) {
+  // Five or more tiles fill the bottom of the screen, so the pill goes up.
+  if (mode == CLOCK_PILL_TOP_RIGHT || outputCount >= 5) {
     lv_obj_set_pos(clockPill, 657, 24);
   } else {
     lv_obj_set_pos(clockPill, 657, 417);
@@ -3636,147 +3646,137 @@ lv_obj_t *createTile(lv_obj_t *parent, int x, int y, int w, int h, lv_event_cb_t
 // UI state updates
 // =====================================================
 
-void updateCeilingUI() {
-  if (ceilingLabel) {
-    lv_label_set_text(ceilingLabel, lightName1);
+// ---- Tile decor ----
+// How a tile is dressed: its icon (an RGB565 image on the card, or a glyph
+// when absent), up to two little glow pools that light up with the output,
+// and where the name sits. Positions are for a 233x160 tile and scale with
+// the tile when the grid is denser. The first two keep the hand-placed art of
+// the original ceiling and wall tiles pixel for pixel; every further output
+// uses the generic set with /icons/outN.rgb565 if that file exists.
+static const TileDecor TILE_DECOR_LEGACY[2] = {
+  { "/icons/ceiling.rgb565", 4, -18, 127, 145,
+    { { 19, 89, 43, 20, 30, 210, 0xF0B83A, 0xFFE078, false, 0 },
+      { 76, 62, 45, 20, 36, 230, 0xF0B83A, 0xFFE078, false, 0 } },
+    0, 44, 0xB06B3A },
+  { "/icons/panel.rgb565", 0, 22, 68, 94,
+    { { 39,  12, 12, 18, LV_RADIUS_CIRCLE, 220, 0xFFE7A6, 0xF6C15A, true, 80 },
+      { 39, 105, 12, 18, 24,               235, 0xF6C15A, 0xFFE7A6, true, 90 } },
+    2, 48, 0x111111 },
+};
+static const TileDecor TILE_DECOR_GENERIC = {
+  nullptr, 12, 14, 96, 96,
+  { { 30, 96, 60, 22, 30, 210, 0xF0B83A, 0xFFE078, false, 0 },
+    {  0,  0,  0,  0,  0,   0, 0,        0,        false, 0 } },
+  0, 44, 0xB06B3A };
+
+static const TileDecor *tileDecorFor(uint8_t i) { return i < 2 ? &TILE_DECOR_LEGACY[i] : &TILE_DECOR_GENERIC; }
+
+// ---- Tile layout ----
+// The switch area runs from the bell's right edge (or the left margin) to
+// x=615, between y=118 and y=459; the band right of it is wallpaper and is
+// never entered. The bell keeps its full width for one or two outputs and
+// narrows for more. Columns: with a bell 1 (N<=2) or 2; without, 1 / 2 / 3.
+// N=2 + bell reproduces the original positions exactly (382,118 / 382,299).
+static int16_t bellTileWidth() {
+  if (!bellPresent) return 0;
+  return outputCount <= 2 ? 300 : (outputCount <= 4 ? 210 : 168);
+}
+static void computeTileLayout(TileRect *r) {
+  const int16_t X0 = 40, XR = 615, Y0 = 118, Y1 = 459;
+  int16_t x0 = X0;
+  if (bellPresent) x0 = X0 + bellTileWidth() + (outputCount <= 2 ? 42 : 20);
+  uint8_t cols = bellPresent ? (outputCount <= 2 ? 1 : 2)
+                             : (outputCount <= 2 ? 1 : (outputCount <= 4 ? 2 : 3));
+  uint8_t rows = (outputCount + cols - 1) / cols;
+  int16_t gc = 16, gr = rows <= 2 ? 21 : 14;
+  int16_t tw = (XR - x0 - gc * (cols - 1)) / cols;
+  int16_t th = (Y1 - Y0 - gr * (rows - 1)) / rows;
+  for (uint8_t i = 0; i < outputCount; i++) {
+    r[i].x = x0 + (i % cols) * (tw + gc);
+    r[i].y = Y0 + (i / cols) * (th + gr);
+    r[i].w = tw; r[i].h = th;
   }
+}
 
-  if (ceilingTile) {
-    styleTileActive(ceilingTile, ceilingState);
+// Name font: FONT_26 when the name fits the tile, otherwise FONT_18 -- the
+// two sizes already in flash; nothing is scaled, nothing new is linked.
+static const lv_font_t *fitNameFont(const char *name, int16_t avail, int16_t th) {
+  if (th < 90) return FONT_18;
+  lv_point_t sz;
+  lv_txt_get_size(&sz, name, FONT_26, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+  return sz.x <= avail ? FONT_26 : FONT_18;
+}
+
+// ---- One update path for every tile ----
+static void updateOutputUI(uint8_t i) {
+  if (i >= outputCount) return;
+  Output &o = outputs[i];
+  const TileDecor *d = tileDecorFor(i);
+
+  if (o.label) {
+    lv_label_set_text(o.label, o.name);
+    lv_obj_set_style_text_font(o.label, fitNameFont(o.name, lv_obj_get_width(o.label), lv_obj_get_height(o.tile)), 0);
   }
+  if (o.tile) styleTileActive(o.tile, o.on);
 
-  if ((ceilingGlowLeft || ceilingGlowRight) && ceilingGlowStateShown != ceilingState) {
-    ceilingGlowStateShown = ceilingState;
-
-    if (ceilingGlowLeft) {
-      lv_anim_del(ceilingGlowLeft, overlayOpaAnimCb);
+  bool anyGlow = o.glow[0] || o.glow[1];
+  if (anyGlow && o.glowShown != o.on) {
+    o.glowShown = o.on;
+    for (uint8_t g = 0; g < 2; g++) {
+      if (!o.glow[g]) continue;
+      lv_anim_del(o.glow[g], overlayOpaAnimCb);
       lv_anim_t a;
       lv_anim_init(&a);
-      lv_anim_set_var(&a, ceilingGlowLeft);
+      lv_anim_set_var(&a, o.glow[g]);
       lv_anim_set_exec_cb(&a, overlayOpaAnimCb);
-      lv_anim_set_values(&a, ceilingState ? 0 : 210, ceilingState ? 210 : 0);
-      lv_anim_set_time(&a, 260);
+      lv_anim_set_values(&a, o.on ? 0 : d->glow[g].opaOn, o.on ? d->glow[g].opaOn : 0);
+      lv_anim_set_time(&a, g == 0 ? 260 : 280);
       lv_anim_set_path_cb(&a, lv_anim_path_ease_in_out);
       lv_anim_start(&a);
     }
-
-    if (ceilingGlowRight) {
-      lv_anim_del(ceilingGlowRight, overlayOpaAnimCb);
-      lv_anim_t b;
-      lv_anim_init(&b);
-      lv_anim_set_var(&b, ceilingGlowRight);
-      lv_anim_set_exec_cb(&b, overlayOpaAnimCb);
-      lv_anim_set_values(&b, ceilingState ? 0 : 230, ceilingState ? 230 : 0);
-      lv_anim_set_time(&b, 280);
-      lv_anim_set_path_cb(&b, lv_anim_path_ease_in_out);
-      lv_anim_start(&b);
-    }
-  } else {
-    if (ceilingGlowLeft) {
-      lv_obj_set_style_bg_opa(ceilingGlowLeft, ceilingState ? 255 : 0, 0);
-    }
-    if (ceilingGlowRight) {
-      lv_obj_set_style_bg_opa(ceilingGlowRight, ceilingState ? 255 : 0, 0);
+  } else if (anyGlow) {
+    for (uint8_t g = 0; g < 2; g++) {
+      if (!o.glow[g]) continue;
+      lv_obj_set_style_bg_opa(o.glow[g], o.on ? d->glow[g].opaOn : 0, 0);
+      if (d->glow[g].shadow) lv_obj_set_style_shadow_opa(o.glow[g], o.on ? d->glow[g].shOpa : 0, 0);
     }
   }
 
-  if (ceilingModeBadge) {
-    if (autoLightTarget == AUTO_TARGET_CEILING) {
-      lv_label_set_text(ceilingModeBadge, autoMode == AUTO_MODE_AUTO ? "A" : "M");
-      lv_obj_set_style_text_opa(ceilingModeBadge, autoMode == AUTO_MODE_AUTO ? 190 : 240, 0);
+  if (o.badge) {
+    if (i == motionTarget) {
+      lv_label_set_text(o.badge, autoMode == AUTO_MODE_AUTO ? "A" : "M");
+      lv_obj_set_style_text_opa(o.badge, autoMode == AUTO_MODE_AUTO ? 190 : 240, 0);
     } else {
-      // Ceiling is a plain manual light right now -- no A/M badge.
-      lv_obj_set_style_text_opa(ceilingModeBadge, 0, 0);
+      lv_obj_set_style_text_opa(o.badge, 0, 0);     // a plain manual light: no A/M badge
     }
   }
 
-  setStateDot(ceilingDot, ceilingState);
+  setStateDot(o.dot, o.on);
 }
 
-// ---- Generic "whichever light is currently the AUTO one" helpers ----
-// Everything in the AUTO/MANUAL state machine (updateMotionSensor,
-// ceilingCb/panelCb's auto branch, the manual-hold timer, the reminder)
-// goes through these instead of touching PCF_CEILING_PIN/PCF_PANEL_PIN
-// directly, so flipping autoLightTarget in Settings is the only thing
-// that needs to change to reassign motion control to the other light.
-bool autoOutputState() {
-  return (autoLightTarget == AUTO_TARGET_CEILING) ? ceilingState : panelOutputState;
-}
+static void updateAllOutputUI() { for (uint8_t i = 0; i < outputCount; i++) updateOutputUI(i); }
+
+// ---- The motion-controlled output ----
+// Everything in the AUTO/MANUAL state machine (updateMotionSensor, the tile
+// tap, the manual-hold timer, the reminder) goes through these, so
+// changing motionTarget in Settings is the only thing needed to hand motion
+// control to another output.
+bool autoOutputState() { return outputs[motionTarget].on; }
 
 void applyAutoOutput(bool on) {
-  if (autoLightTarget == AUTO_TARGET_CEILING) {
-    ceilingState = on;
-    pcfSetPin(PCF_CEILING_PIN, on);
-  } else {
-    panelOutputState = on;
-    pcfSetPin(PCF_PANEL_PIN, on);
-  }
+  outputs[motionTarget].on = on;
+  pcfSetPin(outputs[motionTarget].pin, on);
 }
 
-void updateAutoLightUI() {
-  if (autoLightTarget == AUTO_TARGET_CEILING) {
-    updateCeilingUI();
-  } else {
-    updatePanelUI();
-  }
-}
+void updateAutoLightUI() { updateOutputUI(motionTarget); }
 
-void updatePanelUI() {
-  if (panelTile) {
-    styleTileActive(panelTile, panelOutputState);
-  }
-
-  if (panelLabel) {
-    lv_label_set_text(panelLabel, lightName2);
-  }
-
-  if (panelModeBadge) {
-    if (autoLightTarget == AUTO_TARGET_PANEL) {
-      lv_label_set_text(panelModeBadge, autoMode == AUTO_MODE_AUTO ? "A" : "M");
-      lv_obj_set_style_text_opa(panelModeBadge, autoMode == AUTO_MODE_AUTO ? 190 : 240, 0);
-    } else {
-      lv_obj_set_style_text_opa(panelModeBadge, 0, 0);
-    }
-  }
-
-  if ((panelGlowTop || panelGlowBottom) && panelGlowStateShown != panelOutputState) {
-    panelGlowStateShown = panelOutputState;
-
-    if (panelGlowTop) {
-      lv_anim_del(panelGlowTop, overlayOpaAnimCb);
-      lv_anim_t a;
-      lv_anim_init(&a);
-      lv_anim_set_var(&a, panelGlowTop);
-      lv_anim_set_exec_cb(&a, overlayOpaAnimCb);
-      lv_anim_set_values(&a, panelOutputState ? 0 : 220, panelOutputState ? 220 : 0);
-      lv_anim_set_time(&a, 260);
-      lv_anim_set_path_cb(&a, lv_anim_path_ease_in_out);
-      lv_anim_start(&a);
-    }
-
-    if (panelGlowBottom) {
-      lv_anim_del(panelGlowBottom, overlayOpaAnimCb);
-      lv_anim_t b;
-      lv_anim_init(&b);
-      lv_anim_set_var(&b, panelGlowBottom);
-      lv_anim_set_exec_cb(&b, overlayOpaAnimCb);
-      lv_anim_set_values(&b, panelOutputState ? 0 : 235, panelOutputState ? 235 : 0);
-      lv_anim_set_time(&b, 280);
-      lv_anim_set_path_cb(&b, lv_anim_path_ease_in_out);
-      lv_anim_start(&b);
-    }
-  } else {
-    if (panelGlowTop) {
-      lv_obj_set_style_bg_opa(panelGlowTop, panelOutputState ? 145 : 0, 0);
-      lv_obj_set_style_shadow_opa(panelGlowTop, panelOutputState ? 80 : 0, 0);
-    }
-    if (panelGlowBottom) {
-      lv_obj_set_style_bg_opa(panelGlowBottom, panelOutputState ? 165 : 0, 0);
-      lv_obj_set_style_shadow_opa(panelGlowBottom, panelOutputState ? 90 : 0, 0);
-    }
-  }
-
-  setStateDot(panelDot, panelOutputState);
+// Switch one output by hand (tile tap, phone). The motion output gets the
+// manual-session treatment; any other is a plain switch.
+static void setOutputManual(uint8_t i, bool on) {
+  if (i >= outputCount) return;
+  outputs[i].on = on;
+  pcfSetPin(outputs[i].pin, on);
+  updateOutputUI(i);
 }
 
 void updateStatus(const char *text) {
@@ -3830,17 +3830,11 @@ void applyThemeColors() {
     lv_obj_set_style_text_opa(clockAmPmLabel, 230, 0);
   }
 
-  if (ceilingLabel) {
-    lv_obj_set_style_text_color(ceilingLabel, lv_color_hex(tileTextColor), 0);
-  }
-
-  if (panelLabel) {
-    lv_obj_set_style_text_color(panelLabel, lv_color_hex(tileTextColor), 0);
-  }
+  for (uint8_t i = 0; i < outputCount; i++)
+    if (outputs[i].label) lv_obj_set_style_text_color(outputs[i].label, lv_color_hex(tileTextColor), 0);
 
   applyClockPillPlacement();
-  updateCeilingUI();
-  updatePanelUI();
+  updateAllOutputUI();
 }
 
 
@@ -3853,8 +3847,7 @@ void adminAllOffCb(lv_event_t *e) {
 
   wakeScreen();
   allOutputsOff();
-  updateCeilingUI();
-  updatePanelUI();
+  updateAllOutputUI();
   updateStatus("Admin: All outputs OFF");
 }
 
@@ -3954,7 +3947,7 @@ void doorbellCb(lv_event_t *e) {
 
 // Shared AUTO -> MANUAL ON -> MANUAL OFF -> MANUAL ON cycle, used by
 // whichever tile (ceiling or panel) is currently assigned as the motion-
-// controlled light. See autoLightTarget / applyAutoOutput / updateAutoLightUI.
+// controlled light. See motionTarget / applyAutoOutput / updateAutoLightUI.
 void handleAutoLightTap() {
   if (autoMode == AUTO_MODE_AUTO) {
     // Manual ON: keep the light ON until the user turns it off or the
@@ -3989,42 +3982,24 @@ void handleAutoLightTap() {
   updateAutoLightUI();
 }
 
-void panelCb(lv_event_t *e) {
+// One callback for every output tile; the tile tells us which output.
+void outputTileCb(lv_event_t *e) {
   if (firmwareUpdateRunning) return;
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  lv_obj_t *t = lv_event_get_target(e);
+  uint8_t i = 0;
+  while (i < outputCount && outputs[i].tile != t) i++;
+  if (i >= outputCount) return;
 
   wakeScreen();
 
-  if (autoLightTarget == AUTO_TARGET_PANEL) {
+  if (i == motionTarget) {
     handleAutoLightTap();
     return;
   }
-
-  // Panel isn't the motion-controlled light right now -- plain manual toggle.
-  panelOutputState = !panelOutputState;
-  pcfSetPin(PCF_PANEL_PIN, panelOutputState);
-
-  updatePanelUI();
-  updateStatus(panelOutputState ? "Status: Panel ON" : "Status: Panel OFF");
-}
-
-void ceilingCb(lv_event_t *e) {
-  if (firmwareUpdateRunning) return;
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-
-  wakeScreen();
-
-  if (autoLightTarget == AUTO_TARGET_CEILING) {
-    handleAutoLightTap();
-    return;
-  }
-
-  // Ceiling isn't the motion-controlled light right now -- plain manual toggle.
-  ceilingState = !ceilingState;
-  pcfSetPin(PCF_CEILING_PIN, ceilingState);
-
-  updateCeilingUI();
-  updateStatus(ceilingState ? "Status: Ceiling ON" : "Status: Ceiling OFF");
+  // Not the motion-controlled output: plain manual toggle.
+  setOutputManual(i, !outputs[i].on);
+  updateStatus(outputs[i].on ? "Status: Light ON" : "Status: Light OFF");
 }
 
 void showProdDiagScreen();
@@ -4740,9 +4715,8 @@ enum RemoteCommand : uint8_t {
   RCMD_HELP,
   RCMD_UPGRADE,
   RCMD_VERSION,   // silent: the phone page asking for version + light state
-  RCMD_LIGHT_ON_1, RCMD_LIGHT_OFF_1,   // one light by number (1 = ceiling relay,
-  RCMD_LIGHT_ON_2, RCMD_LIGHT_OFF_2,   //                      2 = wall relay)
-  RCMD_NAME,      // "name 1 Porch Light": rename a light (text in pendingRemoteArg)
+  RCMD_LIGHT_ON, RCMD_LIGHT_OFF,       // one output by number ("on 3"); the digit is pendingRemoteArg[0]
+  RCMD_NAME,      // "name 1 Porch Light": rename an output (digit + text in pendingRemoteArg)
   RCMD_UNKNOWN
 };
 
@@ -4816,7 +4790,7 @@ static void remoteHandleStreamLine(const char *line, time_t minTime) {
   cmd[j] = '\0';
 
   // "name <1|2> <text>" keeps the text's own capitalisation.
-  if ((cmd[0] == 'n' && strncmp(cmd, "name ", 5) == 0) && (cmd[5] == '1' || cmd[5] == '2') && cmd[6] == ' ') {
+  if ((cmd[0] == 'n' && strncmp(cmd, "name ", 5) == 0) && cmd[5] >= '1' && cmd[5] <= '8' && cmd[6] == ' ') {
     const char *t = msg + 7;
     while (*t == ' ') t++;
     size_t n = strlen(t);
@@ -4831,10 +4805,12 @@ static void remoteHandleStreamLine(const char *line, time_t minTime) {
 
   // Exact matches, checked first: the phone page sends these.
   if      (strcmp(cmd, "ver") == 0 || strcmp(cmd, "version") == 0 || strcmp(cmd, "state") == 0) pendingRemoteCommand = RCMD_VERSION;
-  else if (strcmp(cmd, "on 1") == 0)  pendingRemoteCommand = RCMD_LIGHT_ON_1;
-  else if (strcmp(cmd, "off 1") == 0) pendingRemoteCommand = RCMD_LIGHT_OFF_1;
-  else if (strcmp(cmd, "on 2") == 0)  pendingRemoteCommand = RCMD_LIGHT_ON_2;
-  else if (strcmp(cmd, "off 2") == 0) pendingRemoteCommand = RCMD_LIGHT_OFF_2;
+  else if (strncmp(cmd, "on ", 3) == 0 && cmd[3] >= '1' && cmd[3] <= '8' && cmd[4] == '\0') {
+    pendingRemoteArg[0] = cmd[3]; pendingRemoteArg[1] = '\0'; pendingRemoteCommand = RCMD_LIGHT_ON;
+  }
+  else if (strncmp(cmd, "off ", 4) == 0 && cmd[4] >= '1' && cmd[4] <= '8' && cmd[5] == '\0') {
+    pendingRemoteArg[0] = cmd[4]; pendingRemoteArg[1] = '\0'; pendingRemoteCommand = RCMD_LIGHT_OFF;
+  }
   else if (strcmp(cmd, "on") == 0 || strcmp(cmd, "lights on") == 0) pendingRemoteCommand = RCMD_LIGHTS_ON;
   else if (strstr(cmd, "help"))                          pendingRemoteCommand = RCMD_HELP;
   else if (strstr(cmd, "upgrade") || strstr(cmd, "install")) pendingRemoteCommand = RCMD_UPGRADE;
@@ -5033,8 +5009,8 @@ static void updateSwitchDriverWatch() {
   // control is rewritten on every sensor cycle and heals itself, and when
   // everything is off there is nothing a chip reset could spoil. In those
   // states the relay chip is not read at all.
-  bool otherLightOn = (autoLightTarget == AUTO_TARGET_CEILING) ? panelOutputState : ceilingState;
-  bool manualOn = (autoMode == AUTO_MODE_MANUAL_ON) || otherLightOn;
+  bool manualOn = (autoMode == AUTO_MODE_MANUAL_ON);
+  for (uint8_t i = 0; i < outputCount && !manualOn; i++) if (i != motionTarget && outputs[i].on) manualOn = true;
   if (!manualOn) {
     pcfVerifyDueAt = 0;
   } else {
@@ -5745,7 +5721,9 @@ static void processFirmwareUpdateResults() {
 // OFF ends it and hands control back to the motion sensor. The other light
 // is a plain switch.
 static void remoteSetLight(uint8_t which, bool on) {
-  bool isMotionLight = (which == 1) == (autoLightTarget == AUTO_TARGET_CEILING);
+  if (which < 1 || which > outputCount) return;
+  uint8_t i = which - 1;
+  bool isMotionLight = (i == motionTarget);
   if (isMotionLight) {
     if (on) {
       autoMode = AUTO_MODE_MANUAL_ON;
@@ -5761,16 +5739,10 @@ static void remoteSetLight(uint8_t which, bool on) {
       applyAutoOutput(false);
     }
     updateAutoLightUI();
-  } else if (which == 1) {
-    ceilingState = on;
-    pcfSetPin(PCF_CEILING_PIN, on);
-    updateCeilingUI();
   } else {
-    panelOutputState = on;
-    pcfSetPin(PCF_PANEL_PIN, on);
-    updatePanelUI();
+    setOutputManual(i, on);
   }
-  const char *nm = (which == 1) ? lightName1 : lightName2;
+  const char *nm = outputs[i].name;
   char d[64];
   snprintf(d, sizeof(d), "%s switched %s remotely", nm, on ? "on" : "off");
   logActivityEvent("REMOTE", d);
@@ -5783,22 +5755,22 @@ static void remoteSetLight(uint8_t which, bool on) {
 
 // ---- Version + light state for the phone page ----
 // One line on "<topic>-ver" (no phone subscribes to it, so no notification):
-//   5.7.0|Ceiling Glow=1,auto|Wall Accent=0
-// Each light: name=0/1, and for the motion light a tag: ",auto" (sensor in
-// charge) or ",manual" (a manual session, on or off). Sent when the page asks
-// and after every change the phone makes, at most once every 3 s.
+//   5.8.0|Ceiling Glow=1,auto|Wall Accent=0|Porch=1
+// One field per output: name=0/1, and on the motion output a tag ",auto"
+// (sensor in charge) or ",manual" (a manual session, on or off). Sent when
+// the page asks and after every change the phone makes, at most once per 3 s.
 static void queueStateReply() {
   static unsigned long lastAt = 0;
   if (lastAt != 0 && millis() - lastAt < 3000UL) return;
   if (WiFi.status() != WL_CONNECTED) return;
   lastAt = millis();
   const char *tag = (autoMode == AUTO_MODE_AUTO) ? ",auto" : ",manual";
-  bool c = (autoLightTarget == AUTO_TARGET_CEILING);
   PushNotificationParams *p = new PushNotificationParams();   // zero-initialised
   strncpy(p->suffix, "-ver", sizeof(p->suffix) - 1);
-  snprintf(p->message, sizeof(p->message), "%s|%s=%d%s|%s=%d%s",
-           FW_VERSION, lightName1, ceilingState ? 1 : 0, c ? tag : "",
-           lightName2, panelOutputState ? 1 : 0, c ? "" : tag);
+  size_t n = snprintf(p->message, sizeof(p->message), "%s", FW_VERSION);
+  for (uint8_t i = 0; i < outputCount && n < sizeof(p->message) - 1; i++)
+    n += snprintf(p->message + n, sizeof(p->message) - n, "|%s=%d%s",
+                  outputs[i].name, outputs[i].on ? 1 : 0, i == motionTarget ? tag : "");
   strncpy(p->priority, "min", sizeof(p->priority) - 1);
   enqueuePush(p);
 }
@@ -5818,13 +5790,15 @@ static bool remoteRenameLight(uint8_t which, const char *text) {
   while (n && clean[n - 1] == ' ') n--;
   clean[n] = '\0';
   if (n == 0) return false;
-  char *dst = (which == 1) ? lightName1 : lightName2;
+  if (which < 1 || which > outputCount) return false;
+  char *dst = outputs[which - 1].name;
   strncpy(dst, clean, LIGHT_NAME_MAX); dst[LIGHT_NAME_MAX] = '\0';
+  char key[8];
+  snprintf(key, sizeof(key), "name%u", (unsigned)which);
   prefs.begin("doorpanel", false);
-  prefs.putString(which == 1 ? "name1" : "name2", dst);
+  prefs.putString(key, dst);
   prefs.end();
-  updateCeilingUI();
-  updatePanelUI();
+  updateOutputUI(which - 1);
   refreshAutoTargetLabel();
   return true;
 }
@@ -5854,16 +5828,8 @@ static void processRemoteCommand() {
 
   switch (cmd) {
     case RCMD_LIGHTS_OFF: {
-      // The non-motion light: plain off.
-      if (autoLightTarget == AUTO_TARGET_CEILING) {
-        panelOutputState = false;
-        pcfSetPin(PCF_PANEL_PIN, false);
-        updatePanelUI();
-      } else {
-        ceilingState = false;
-        pcfSetPin(PCF_CEILING_PIN, false);
-        updateCeilingUI();
-      }
+      // Every output but the motion one: plain off.
+      for (uint8_t i = 0; i < outputCount; i++) if (i != motionTarget) setOutputManual(i, false);
       // The motion light: end any manual session, drop any auto hold, and
       // hand control back to AUTO (one clean sensor CLEAR required before
       // it may react again -- same discipline as a manual-off tap).
@@ -5874,7 +5840,7 @@ static void processRemoteCommand() {
       motionRearmAfterManualOffClear = true;
       applyAutoOutput(false);
       updateAutoLightUI();
-      pcfSetPin(PCF_SPARE_PIN, false);       // "All off" means every switched output
+      if (outputCount < 3) pcfSetPin(PCF_SPARE_PIN, false);   // unused spare: off as well
       updateStatus("Status: All OFF (remote)");
       logActivityEvent("REMOTE", "All outputs switched off remotely");
       sendRemoteReply("All off. Motion sensing is back in charge.");
@@ -5883,16 +5849,8 @@ static void processRemoteCommand() {
     }
 
     case RCMD_LIGHTS_ON: {
-      // The non-motion light: plain on.
-      if (autoLightTarget == AUTO_TARGET_CEILING) {
-        panelOutputState = true;
-        pcfSetPin(PCF_PANEL_PIN, true);
-        updatePanelUI();
-      } else {
-        ceilingState = true;
-        pcfSetPin(PCF_CEILING_PIN, true);
-        updateCeilingUI();
-      }
+      // Every output but the motion one: plain on.
+      for (uint8_t i = 0; i < outputCount; i++) if (i != motionTarget) setOutputManual(i, true);
       // The motion light: a manual-on session, exactly like tapping its
       // tile on the panel -- it stays on until switched off or the usual
       // sunrise / safety cutoff.
@@ -5908,18 +5866,16 @@ static void processRemoteCommand() {
       break;
     }
 
-    case RCMD_LIGHT_ON_1:  remoteSetLight(1, true);  queueStateReply(); break;
-    case RCMD_LIGHT_OFF_1: remoteSetLight(1, false); queueStateReply(); break;
-    case RCMD_LIGHT_ON_2:  remoteSetLight(2, true);  queueStateReply(); break;
-    case RCMD_LIGHT_OFF_2: remoteSetLight(2, false); queueStateReply(); break;
+    case RCMD_LIGHT_ON:  remoteSetLight(pendingRemoteArg[0] - '0', true);  queueStateReply(); break;
+    case RCMD_LIGHT_OFF: remoteSetLight(pendingRemoteArg[0] - '0', false); queueStateReply(); break;
 
     case RCMD_NAME: {
-      uint8_t which = (pendingRemoteArg[0] == '2') ? 2 : 1;
+      uint8_t which = pendingRemoteArg[0] - '0';
       char msg[64];
       if (remoteRenameLight(which, pendingRemoteArg + 1)) {
-        snprintf(msg, sizeof(msg), "Light %u renamed to %s", which, which == 1 ? lightName1 : lightName2);
+        snprintf(msg, sizeof(msg), "Light %u renamed to %s", which, outputs[which - 1].name);
         logActivityEvent("REMOTE", msg);
-        snprintf(msg, sizeof(msg), "Renamed to %s.", which == 1 ? lightName1 : lightName2);
+        snprintf(msg, sizeof(msg), "Renamed to %s.", outputs[which - 1].name);
       } else {
         snprintf(msg, sizeof(msg), "That name won't work. Use 1 to 14 letters or numbers.");
       }
@@ -5952,12 +5908,14 @@ static void processRemoteCommand() {
       unsigned long upMin = millis() / 60000UL;
       int rssi = WiFi.status() == WL_CONNECTED ? (int)WiFi.RSSI() : 0;
       const char *wifi = rssi == 0 ? "off" : rssi >= -65 ? "strong" : rssi >= -75 ? "good" : "weak";
+      size_t n;
       if (upMin >= 60)
-        snprintf(msg, sizeof(msg), "All good. v%s, up %lu h %lu min, Wi-Fi %s. %s %s, %s %s.",
-                 FW_VERSION, upMin / 60, upMin % 60, wifi, lightName1, ceilingState ? "on" : "off", lightName2, panelOutputState ? "on" : "off");
+        n = snprintf(msg, sizeof(msg), "All good. v%s, up %lu h %lu min, Wi-Fi %s.", FW_VERSION, upMin / 60, upMin % 60, wifi);
       else
-        snprintf(msg, sizeof(msg), "All good. v%s, up %lu min, Wi-Fi %s. %s %s, %s %s.",
-                 FW_VERSION, upMin, wifi, lightName1, ceilingState ? "on" : "off", lightName2, panelOutputState ? "on" : "off");
+        n = snprintf(msg, sizeof(msg), "All good. v%s, up %lu min, Wi-Fi %s.", FW_VERSION, upMin, wifi);
+      for (uint8_t i = 0; i < outputCount && n < sizeof(msg) - 1; i++)
+        n += snprintf(msg + n, sizeof(msg) - n, "%s %s %s%s", i == 0 ? "" : ",", outputs[i].name,
+                      outputs[i].on ? "on" : "off", i + 1 == outputCount ? "." : "");
       sendRemoteReply(msg);
       break;
     }
@@ -6043,7 +6001,7 @@ void updateAutoLightManualOnReminder() {
   if (isAutoReminderQuietHoursNow() && !someoneAbout) return;
   remindedSessionStart = autoManualStartedAt;
 
-  const char *lightName = (autoLightTarget == AUTO_TARGET_CEILING) ? lightName1 : lightName2;
+  const char *lightName = outputs[motionTarget].name;
   char message[120];
   int hrs = (int)(onForMs / 3600000UL);
   snprintf(message, sizeof(message), "Still on after %d hour%s. Left on by mistake?", hrs, hrs == 1 ? "" : "s");
@@ -6392,51 +6350,42 @@ void createMainUI() {
   lv_obj_clear_flag(adminHotspot, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_add_event_cb(adminHotspot, adminHotspotLongPressCb, LV_EVENT_LONG_PRESSED, NULL);
 
-  bellTile = createTile(mainScreen, 40, 118, 300, 341, doorbellCb);
-  styleTileActive(bellTile, false);
-  bellPressOverlay = createPressOverlay(bellTile, 300, 341);
-  attachTilePressOverlay(bellTile, bellPressOverlay);
+  // Doorbell tile: present or not per NVS ("bell"), full width for one or
+  // two outputs, narrower for a denser grid -- the art scales with it.
+  bellTile = nullptr; bellIcon = nullptr; bellRingInner = nullptr; bellRingOuter = nullptr;
+  if (bellPresent) {
+    const int16_t bw = bellTileWidth();
+    const float bf = bw / 300.0f;                       // 1.0 for the original width
+    const int16_t byOff = (int16_t)((341 - 341 * bf) / 2);
+    bellTile = createTile(mainScreen, 40, 118, bw, 341, doorbellCb);
+    styleTileActive(bellTile, false);
+    bellPressOverlay = createPressOverlay(bellTile, bw, 341);
+    attachTilePressOverlay(bellTile, bellPressOverlay);
 
-  bellIcon = createRGB565Icon(bellTile, "/icons/bell.rgb565", 63, 64, 174, 199, &bellIconDsc, &bellIconBuffer);
+    bellIcon = createRGB565Icon(bellTile, "/icons/bell.rgb565", (int)(63 * bf), (int)(64 * bf) + byOff, 174, 199, &bellIconDsc, &bellIconBuffer);
+    if (!bellIcon) {
+      bellIcon = lv_label_create(bellTile);
+      lv_label_set_text(bellIcon, LV_SYMBOL_BELL);
+      lv_obj_set_style_text_color(bellIcon, lv_color_hex(0x111111), 0);
+      lv_obj_set_style_text_font(bellIcon, FONT_30, 0);
+      lv_obj_set_pos(bellIcon, (int16_t)(135 * bf), (int16_t)(145 * bf) + byOff);
+    } else if (bf < 0.999f) {
+      lv_img_set_pivot(bellIcon, 0, 0);
+      lv_img_set_zoom(bellIcon, (uint16_t)(256 * bf));
+    }
 
-  if (!bellIcon) {
-    bellIcon = lv_label_create(bellTile);
-    lv_label_set_text(bellIcon, LV_SYMBOL_BELL);
-    lv_obj_set_style_text_color(bellIcon, lv_color_hex(0x111111), 0);
-    lv_obj_set_style_text_font(bellIcon, FONT_30, 0);
-    lv_obj_set_pos(bellIcon, 135, 145);
-  }
-  
-  bellRingInner = createRGB565Icon(
-    bellTile,
-    "/icons/bell_ring_inner.rgb565",
-    BELL_RING_X,
-    BELL_RING_Y,
-    BELL_RING_W,
-    BELL_RING_H,
-    &bellRingInnerDsc,
-    &bellRingInnerBuffer,
-    true
-  );
-
-  bellRingOuter = createRGB565Icon(
-    bellTile,
-    "/icons/bell_ring_outer.rgb565",
-    BELL_RING_X,
-    BELL_RING_Y,
-    BELL_RING_W,
-    BELL_RING_H,
-    &bellRingOuterDsc,
-    &bellRingOuterBuffer,
-    true
-  );
-
-  if (bellRingInner) {
-    lv_obj_set_style_img_opa(bellRingInner, LV_OPA_COVER, 0);
-  }
-
-  if (bellRingOuter) {
-    lv_obj_set_style_img_opa(bellRingOuter, LV_OPA_COVER, 0);
+    bellRingInner = createRGB565Icon(bellTile, "/icons/bell_ring_inner.rgb565",
+      (int)(BELL_RING_X * bf), (int)(BELL_RING_Y * bf) + byOff, BELL_RING_W, BELL_RING_H, &bellRingInnerDsc, &bellRingInnerBuffer, true);
+    bellRingOuter = createRGB565Icon(bellTile, "/icons/bell_ring_outer.rgb565",
+      (int)(BELL_RING_X * bf), (int)(BELL_RING_Y * bf) + byOff, BELL_RING_W, BELL_RING_H, &bellRingOuterDsc, &bellRingOuterBuffer, true);
+    if (bellRingInner) {
+      lv_obj_set_style_img_opa(bellRingInner, LV_OPA_COVER, 0);
+      if (bf < 0.999f) { lv_img_set_pivot(bellRingInner, 0, 0); lv_img_set_zoom(bellRingInner, (uint16_t)(256 * bf)); }
+    }
+    if (bellRingOuter) {
+      lv_obj_set_style_img_opa(bellRingOuter, LV_OPA_COVER, 0);
+      if (bf < 0.999f) { lv_img_set_pivot(bellRingOuter, 0, 0); lv_img_set_zoom(bellRingOuter, (uint16_t)(256 * bf)); }
+    }
   }
 
   // No external red wave labels here.
@@ -6445,129 +6394,83 @@ void createMainUI() {
   bellWave1 = nullptr;
   bellWave2 = nullptr;
 
-  ceilingTile = createTile(mainScreen, 382, 118, 233, 160, ceilingCb);
-  ceilingPressOverlay = createPressOverlay(ceilingTile, 233, 160);
-  attachTilePressOverlay(ceilingTile, ceilingPressOverlay);
+  // Output tiles, one per configured output, placed by computeTileLayout().
+  // Decor (icon, glow pools, label offsets) is designed for 233x160 and
+  // scaled by f when the grid is denser; f is 1.0 for the classic 2 + bell.
+  TileRect rects[MAX_OUTPUTS];
+  computeTileLayout(rects);
+  for (uint8_t i = 0; i < outputCount; i++) {
+    Output &o = outputs[i];
+    const TileDecor *d = tileDecorFor(i);
+    const TileRect &r = rects[i];
+    float f = r.w / 233.0f;
+    if (r.h / 160.0f < f) f = r.h / 160.0f;
+    if (f > 1.0f) f = 1.0f;
 
-  // Two tiny glow pools under the two lamps. These are much lighter than
-  // image animation and avoid the old rectangular glow look.
-  ceilingGlowLeft = lv_obj_create(ceilingTile);
-  lv_obj_remove_style_all(ceilingGlowLeft);
-  lv_obj_set_pos(ceilingGlowLeft, 19, 89);
-  lv_obj_set_size(ceilingGlowLeft, 43, 20);
-  lv_obj_set_style_radius(ceilingGlowLeft, 30, 0);
-  lv_obj_set_style_bg_color(ceilingGlowLeft, lv_color_hex(0xF0B83A), 0);
-  lv_obj_set_style_bg_grad_color(ceilingGlowLeft, lv_color_hex(0xFFE078), 0);
-  lv_obj_set_style_bg_grad_dir(ceilingGlowLeft, LV_GRAD_DIR_VER, 0);
-  lv_obj_set_style_bg_opa(ceilingGlowLeft, 0, 0);
-  lv_obj_clear_flag(ceilingGlowLeft, LV_OBJ_FLAG_CLICKABLE);
-  lv_obj_clear_flag(ceilingGlowLeft, LV_OBJ_FLAG_SCROLLABLE);
+    o.tile = createTile(mainScreen, r.x, r.y, r.w, r.h, outputTileCb);
+    o.press = createPressOverlay(o.tile, r.w, r.h);
+    attachTilePressOverlay(o.tile, o.press);
 
-  ceilingGlowRight = lv_obj_create(ceilingTile);
-  lv_obj_remove_style_all(ceilingGlowRight);
-  lv_obj_set_pos(ceilingGlowRight, 76, 62);
-  lv_obj_set_size(ceilingGlowRight, 45, 20);
-  lv_obj_set_style_radius(ceilingGlowRight, 36, 0);
-  lv_obj_set_style_bg_color(ceilingGlowRight, lv_color_hex(0xF0B83A), 0);
-  lv_obj_set_style_bg_grad_color(ceilingGlowRight, lv_color_hex(0xFFE078), 0);
-  lv_obj_set_style_bg_grad_dir(ceilingGlowRight, LV_GRAD_DIR_VER, 0);
-  lv_obj_set_style_bg_opa(ceilingGlowRight, 0, 0);
-  lv_obj_clear_flag(ceilingGlowRight, LV_OBJ_FLAG_CLICKABLE);
-  lv_obj_clear_flag(ceilingGlowRight, LV_OBJ_FLAG_SCROLLABLE);
+    for (uint8_t g = 0; g < 2; g++) {
+      const TileGlow &G = d->glow[g];
+      if (G.w == 0) { o.glow[g] = nullptr; continue; }
+      lv_obj_t *gl = lv_obj_create(o.tile);
+      lv_obj_remove_style_all(gl);
+      lv_obj_set_pos(gl, (int16_t)(G.x * f), (int16_t)(G.y * f));
+      lv_obj_set_size(gl, (int16_t)(G.w * f), (int16_t)(G.h * f));
+      lv_obj_set_style_radius(gl, G.r == LV_RADIUS_CIRCLE ? LV_RADIUS_CIRCLE : (int16_t)(G.r * f), 0);
+      lv_obj_set_style_bg_color(gl, lv_color_hex(G.c1), 0);
+      lv_obj_set_style_bg_grad_color(gl, lv_color_hex(G.c2), 0);
+      lv_obj_set_style_bg_grad_dir(gl, LV_GRAD_DIR_VER, 0);
+      lv_obj_set_style_bg_opa(gl, 0, 0);
+      if (G.shadow) {
+        lv_obj_set_style_shadow_width(gl, 12, 0);
+        lv_obj_set_style_shadow_spread(gl, 2, 0);
+        lv_obj_set_style_shadow_color(gl, lv_color_hex(0xF6C15A), 0);
+        lv_obj_set_style_shadow_opa(gl, 0, 0);
+      }
+      lv_obj_clear_flag(gl, LV_OBJ_FLAG_CLICKABLE);
+      lv_obj_clear_flag(gl, LV_OBJ_FLAG_SCROLLABLE);
+      o.glow[g] = gl;
+    }
+    o.glowShown = false;
 
-  lv_obj_t *ceilingIcon = createRGB565Icon(ceilingTile, "/icons/ceiling.rgb565", 4, -18, 127, 145, &ceilingIconDsc, &ceilingIconBuffer);
+    // Icon: the decor's own file, or /icons/outN.rgb565 for a generic output;
+    // a glyph when the card has neither.
+    char iconPath[32];
+    const char *ip = d->icon;
+    if (!ip) { snprintf(iconPath, sizeof(iconPath), "/icons/out%u.rgb565", (unsigned)(i + 1)); ip = iconPath; }
+    lv_obj_t *icon = createRGB565Icon(o.tile, ip, (int)(d->ix * f), (int)(d->iy * f), d->iw, d->ih, &o.iconDsc, &o.iconBuf);
+    if (icon) {
+      if (f < 0.999f) { lv_img_set_pivot(icon, 0, 0); lv_img_set_zoom(icon, (uint16_t)(256 * f)); }
+    } else {
+      icon = lv_label_create(o.tile);
+      lv_label_set_text(icon, "●");
+      lv_obj_set_style_text_color(icon, lv_color_hex(d->glyphColor), 0);
+      lv_obj_set_style_text_font(icon, FONT_30, 0);
+      lv_obj_set_pos(icon, (int16_t)(38 * f), (int16_t)(30 * f));
+    }
 
-  if (!ceilingIcon) {
-    ceilingIcon = lv_label_create(ceilingTile);
-    lv_label_set_text(ceilingIcon, "●");
-    lv_obj_set_style_text_color(ceilingIcon, lv_color_hex(0xB06B3A), 0);
-    lv_obj_set_style_text_font(ceilingIcon, FONT_30, 0);
-    lv_obj_set_pos(ceilingIcon, 38, 30);
+    o.label = lv_label_create(o.tile);
+    lv_label_set_long_mode(o.label, LV_LABEL_LONG_DOT);
+    lv_label_set_text(o.label, o.name);
+    lv_obj_set_style_text_color(o.label, lv_color_hex(0x1B0505), 0);
+    lv_obj_set_style_text_font(o.label, FONT_26, 0);
+    lv_obj_set_width(o.label, r.w - 28);
+    lv_obj_set_style_text_align(o.label, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_set_pos(o.label, d->lx, r.h - d->lyFromBottom);
+
+    o.dot = createStateDot(o.tile, r.w - 31, 16);
+
+    o.badge = lv_label_create(o.tile);
+    lv_label_set_text(o.badge, "A");
+    lv_obj_set_style_text_color(o.badge, lv_color_hex(0x1B0505), 0);
+    lv_obj_set_style_text_opa(o.badge, 0, 0);          // shown by updateOutputUI on the motion output
+    lv_obj_set_style_text_font(o.badge, FONT_18, 0);
+    lv_obj_set_pos(o.badge, r.w - 51, 14);
   }
 
-  ceilingLabel = lv_label_create(ceilingTile);
-  lv_label_set_text(ceilingLabel, lightName1);
-  lv_obj_set_style_text_color(ceilingLabel, lv_color_hex(0x1B0505), 0);
-  lv_obj_set_style_text_font(ceilingLabel, FONT_26, 0);
-  lv_obj_set_width(ceilingLabel, 205);
-  lv_obj_set_style_text_align(ceilingLabel, LV_TEXT_ALIGN_RIGHT, 0);
-  lv_obj_set_pos(ceilingLabel, 0, 116);
-
-  ceilingDot = createStateDot(ceilingTile, 202, 16);
-
-  ceilingModeBadge = lv_label_create(ceilingTile);
-  lv_label_set_text(ceilingModeBadge, "A");
-  lv_obj_set_style_text_color(ceilingModeBadge, lv_color_hex(0x1B0505), 0);
-  lv_obj_set_style_text_opa(ceilingModeBadge, 210, 0);
-  lv_obj_set_style_text_font(ceilingModeBadge, FONT_18, 0);
-  lv_obj_set_pos(ceilingModeBadge, 182, 14);
-
-  panelTile = createTile(mainScreen, 382, 299, 233, 160, panelCb);
-  panelPressOverlay = createPressOverlay(panelTile, 233, 160);
-  attachTilePressOverlay(panelTile, panelPressOverlay);
-
-  // Wall Accent soft glow, shown behind the icon.
-  // Keep it simple: two warm vertical light pools from the left-side wall decor.
-  panelGlowTop = lv_obj_create(panelTile);
-  lv_obj_remove_style_all(panelGlowTop);
-  lv_obj_set_pos(panelGlowTop, 39, 12);
-  lv_obj_set_size(panelGlowTop, 12, 18);
-  lv_obj_set_style_radius(panelGlowTop, LV_RADIUS_CIRCLE, 0);
-  // Top glow visually rotated 180° by reversing gradient colors
-  lv_obj_set_style_bg_color(panelGlowTop, lv_color_hex(0xFFE7A6), 0);
-  lv_obj_set_style_bg_grad_color(panelGlowTop, lv_color_hex(0xF6C15A), 0);
-  lv_obj_set_style_bg_grad_dir(panelGlowTop, LV_GRAD_DIR_VER, 0);  lv_obj_set_style_bg_opa(panelGlowTop, 0, 0);
-  lv_obj_set_style_shadow_width(panelGlowTop, 12, 0);
-  lv_obj_set_style_shadow_spread(panelGlowTop, 2, 0);
-  lv_obj_set_style_shadow_color(panelGlowTop, lv_color_hex(0xF6C15A), 0);
-  lv_obj_set_style_shadow_opa(panelGlowTop, 0, 0);
-  lv_obj_clear_flag(panelGlowTop, LV_OBJ_FLAG_CLICKABLE);
-  lv_obj_clear_flag(panelGlowTop, LV_OBJ_FLAG_SCROLLABLE);
-
-  panelGlowBottom = lv_obj_create(panelTile);
-  lv_obj_remove_style_all(panelGlowBottom);
-  lv_obj_set_pos(panelGlowBottom, 39, 105);
-  lv_obj_set_size(panelGlowBottom, 12, 18);
-  lv_obj_set_style_radius(panelGlowBottom, 24, 0);
-  lv_obj_set_style_bg_color(panelGlowBottom, lv_color_hex(0xF6C15A), 0);
-  lv_obj_set_style_bg_grad_color(panelGlowBottom, lv_color_hex(0xFFE7A6), 0);
-  lv_obj_set_style_bg_grad_dir(panelGlowBottom, LV_GRAD_DIR_VER, 0);
-  lv_obj_set_style_bg_opa(panelGlowBottom, 0, 0);
-  lv_obj_set_style_shadow_width(panelGlowBottom, 12, 0);
-  lv_obj_set_style_shadow_spread(panelGlowBottom, 2, 0);
-  lv_obj_set_style_shadow_color(panelGlowBottom, lv_color_hex(0xF6C15A), 0);
-  lv_obj_set_style_shadow_opa(panelGlowBottom, 0, 0);
-  lv_obj_clear_flag(panelGlowBottom, LV_OBJ_FLAG_CLICKABLE);
-  lv_obj_clear_flag(panelGlowBottom, LV_OBJ_FLAG_SCROLLABLE);
-
-  lv_obj_t *panelIcon = createRGB565Icon(panelTile, "/icons/panel.rgb565", 0, 22, 68, 94, &panelIconDsc, &panelIconBuffer);
-  if (!panelIcon) {
-    panelIcon = lv_label_create(panelTile);
-    lv_label_set_text(panelIcon, "●");
-    lv_obj_set_style_text_color(panelIcon, lv_color_hex(0x111111), 0);
-    lv_obj_set_style_text_font(panelIcon, FONT_30, 0);
-    lv_obj_set_pos(panelIcon, 38, 30);
-  }
-
-  panelLabel = lv_label_create(panelTile);
-  lv_label_set_text(panelLabel, lightName2);
-  lv_obj_set_style_text_color(panelLabel, lv_color_hex(0x1B0505), 0);
-  lv_obj_set_style_text_font(panelLabel, FONT_26, 0);
-  lv_obj_set_width(panelLabel, 205);
-  lv_obj_set_style_text_align(panelLabel, LV_TEXT_ALIGN_RIGHT, 0);
-  lv_obj_set_pos(panelLabel, 2, 112);
-
-  panelDot = createStateDot(panelTile, 202, 16);
-
-  panelModeBadge = lv_label_create(panelTile);
-  lv_label_set_text(panelModeBadge, "A");
-  lv_obj_set_style_text_color(panelModeBadge, lv_color_hex(0x1B0505), 0);
-  lv_obj_set_style_text_opa(panelModeBadge, 0, 0); // hidden unless panel is the current auto target
-  lv_obj_set_style_text_font(panelModeBadge, FONT_18, 0);
-  lv_obj_set_pos(panelModeBadge, 182, 14);
-
-  updateCeilingUI();
-  updatePanelUI();
+  updateAllOutputUI();
   applyThemeColors();
 
   createWelcomeOverlay();
@@ -7152,8 +7055,7 @@ bool installFirmwareFromSD() {
   delay(150);
   // Safety: all controlled outputs OFF before flashing.
   allOutputsOff();
-  updateCeilingUI();
-  updatePanelUI();
+  updateAllOutputUI();
 
   if (!Update.begin(updateSize, U_FLASH)) {
     updateFile.close();
@@ -7305,7 +7207,7 @@ void refreshManualCooldownLabel() {
 
 void refreshAutoTargetLabel() {
   if (lblAutoTarget) {
-    lv_label_set_text(lblAutoTarget, autoLightTarget == AUTO_TARGET_CEILING ? lightName1 : lightName2);
+    lv_label_set_text(lblAutoTarget, outputs[motionTarget].name);
   }
 }
 
@@ -7380,14 +7282,14 @@ void cycleManualCooldownCb(lv_event_t *e) {
 //   - the light gaining AUTO duty starts back at AUTO/off and requires
 //     one fresh motion clear -> trigger cycle before it can turn on, so
 //     it doesn't immediately snap on from stale motion state
-void applyAutoLightTargetChange(AutoLightTarget newTarget) {
-  if (newTarget == autoLightTarget) return;
+void applyAutoLightTargetChange(uint8_t newTarget) {
+  if (newTarget >= outputCount || newTarget == motionTarget) return;
 
   // Cleanly park whichever light is about to lose AUTO duty.
   applyAutoOutput(false);
   updateAutoLightUI();
 
-  autoLightTarget = newTarget;
+  motionTarget = newTarget;
 
   autoMode = AUTO_MODE_AUTO;
   autoManualStartedAt = 0;
@@ -7396,13 +7298,13 @@ void applyAutoLightTargetChange(AutoLightTarget newTarget) {
   clearMotionAutoHold();
   motionRearmAfterManualOffClear = true;
 
-  updateCeilingUI();
-  updatePanelUI();
+  updateAllOutputUI();
 }
 
 void cycleAutoTargetCb(lv_event_t *e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-  AutoLightTarget newTarget = (autoLightTarget == AUTO_TARGET_CEILING) ? AUTO_TARGET_PANEL : AUTO_TARGET_CEILING;
+  if (outputCount < 2) return;
+  uint8_t newTarget = (uint8_t)((motionTarget + 1) % outputCount);
   applyAutoLightTargetChange(newTarget);
   saveAutoLightTarget();
   refreshAutoTargetLabel();
@@ -9322,7 +9224,7 @@ void showSettingsScreen() {
     char buf[16];
     // Row 2 — Motion controls: which light motion detection drives (new)
     lblAutoTarget = createCycleRow(settingsPanels[TAB_MOTION], "Motion controls", 50, cycleAutoTargetCb,
-      autoLightTarget == AUTO_TARGET_CEILING ? lightName1 : lightName2);
+      outputs[motionTarget].name);
 
     // Row 3 — Motion hold timer (shifted down 50px)
     formatSecondsLabel(buf, sizeof(buf), motionHoldTimeMs);

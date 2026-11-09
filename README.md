@@ -35,6 +35,7 @@ Panel replaces a conventional switchboard anywhere in a home — front door, liv
 ### On the wall
 
 - **Motion-aware lighting** with hold times, dimming and manual override
+- **Two to eight outputs** from one firmware: tiles lay themselves out, names and rules follow each output
 - **Festival themes** — Diwali, Holi, Navratri, Christmas and more — with countdowns and day-of greetings
 - **Weather, clock and welcome screen** that wake with the room
 - **Doorbell and motion alerts** pushed to every phone in the household
@@ -99,9 +100,9 @@ The panel executes a strict whitelist of commands and acknowledges each on `<top
 
 | Control | What it does |
 |---|---|
-| **Two named switches** | One per light, showing its real name and current state; the motion light is tagged *Auto* or *Manual*. Switching the motion light on starts a manual session, off hands it back to the sensor |
+| **One named switch per output** | Two, four or six, as the panel is configured, each showing its real name and current state; the motion light is tagged *Auto* or *Manual*. Switching the motion light on starts a manual session, off hands it back to the sensor |
 | **Tap a name to rename** | The panel's tiles, its notifications and this page all use the new name |
-| **All Lights Off** | Everything off, motion automation back in charge |
+| **All Off** | Every output off, motion automation back in charge |
 | **Check Status** | The panel replies with its state: lights, link, uptime |
 | **Recent Alerts** | Bottom sheet with the last 12 hours of notifications |
 | **Restart Panel** | Confirm-twice, then a clean reboot |
