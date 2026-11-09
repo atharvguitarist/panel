@@ -179,7 +179,7 @@ const char* PHONE_UI_BASE_URL = "https://atharvguitarist.github.io/panel/";
 // straight out of the uploaded .bin -- change ONLY the number. FW_VERSION
 // points past the tag, so every existing use is unchanged, and because it is
 // used everywhere the linker can never strip the tag from the binary.
-const char  FW_VERSION_TAG[] = "PANELFW:5.7.1";
+const char  FW_VERSION_TAG[] = "PANELFW:5.7.2";
 const char* FW_VERSION = FW_VERSION_TAG + 8;
 const char* FW_MANIFEST_PATH = "firmware/manifest.json";
 const char* FW_BINARY_PATH   = "firmware/latest.bin";
@@ -5370,14 +5370,26 @@ static void fwUpgradeTask(void *param) {
   // 1.3MB TLS stream now and then; each attempt asks for the rest of the
   // file with an HTTP Range header and continues from the last byte held.
   // If the server ever ignores Range (200 instead of 206), it restarts at 0.
-  const int MAX_ATTEMPTS = 8;
+  //
+  // The budget is progress, not a count: at -78 dBm a link may drop every
+  // 60-70KB, which is twenty-odd resumes for one image, and every one of
+  // them moves forward. We stop only after six attempts in a row that gained
+  // nothing, or fifteen minutes in all. Modem power-save is suspended for
+  // the duration -- on a weak link it is what turns a slow stream into a
+  // dropped one -- and restored afterwards.
+  const int MAX_IDLE_ATTEMPTS = 6;
+  const unsigned long MAX_TOTAL_MS = 15UL * 60UL * 1000UL;
   size_t total = 0;
-  int lastCode = 0, attempts = 0;
+  int lastCode = 0, attempts = 0, idle = 0;
+  unsigned long startedAt = millis();
+  bool sleepWas = WiFi.getSleep();
+  WiFi.setSleep(false);
 
-  while (attempts < MAX_ATTEMPTS && total < m.size) {
+  while (total < m.size && idle < MAX_IDLE_ATTEMPTS && millis() - startedAt < MAX_TOTAL_MS) {
     attempts++;
-    if (attempts > 1) vTaskDelay(pdMS_TO_TICKS(3000));
-    if (WiFi.status() != WL_CONNECTED) { lastCode = -100; continue; }
+    size_t before = total;
+    if (attempts > 1) vTaskDelay(pdMS_TO_TICKS(2000 + 2000UL * idle));   // 2 s, longer only after dead attempts
+    if (WiFi.status() != WL_CONNECTED) { lastCode = -100; idle++; continue; }
 
     WiFiClientSecure client;
     client.setInsecure();
@@ -5394,7 +5406,7 @@ static void fwUpgradeTask(void *param) {
     int code = http.GET();
     lastCode = code;
     if (code == 200) total = 0;                      // whole file (first try, or Range ignored)
-    if (code != 200 && code != 206) { http.end(); continue; }
+    if (code != 200 && code != 206) { http.end(); idle++; continue; }
 
     WiFiClient *stream = http.getStreamPtr();
     unsigned long lastDataAt = millis();
@@ -5410,18 +5422,20 @@ static void fwUpgradeTask(void *param) {
         firmwareDownloadPct = (uint8_t)((total * 100ULL) / m.size);
         lastDataAt = millis();
       } else {
-        if (millis() - lastDataAt > 15000UL) break;   // stalled: reconnect and resume
+        if (millis() - lastDataAt > 10000UL) break;   // stalled: reconnect and resume
         vTaskDelay(pdMS_TO_TICKS(5));
       }
     }
     http.end();
+    idle = (total > before) ? 0 : idle + 1;
   }
+  WiFi.setSleep(sleepWas);
   xSemaphoreGive(tlsGate);   // network part is over; verification needs no TLS
 
   if (total != m.size) {
     free(img);
-    snprintf(firmwareUpdateMsg, sizeof(firmwareUpdateMsg), "Download incomplete (%u of %u bytes, %d tries, last code %d)",
-             (unsigned)total, (unsigned)m.size, attempts, lastCode);
+    snprintf(firmwareUpdateMsg, sizeof(firmwareUpdateMsg), "Download incomplete (%u of %u bytes, %d tries in %lu min, last code %d)",
+             (unsigned)total, (unsigned)m.size, attempts, (millis() - startedAt) / 60000UL, lastCode);
     firmwareUpdateResult = FWR_FAILED; firmwareDownloadActive = false; vTaskDelete(nullptr); return;
   }
 
