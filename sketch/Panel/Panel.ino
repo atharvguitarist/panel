@@ -179,7 +179,7 @@ const char* PHONE_UI_BASE_URL = "https://atharvguitarist.github.io/panel/";
 // straight out of the uploaded .bin -- change ONLY the number. FW_VERSION
 // points past the tag, so every existing use is unchanged, and because it is
 // used everywhere the linker can never strip the tag from the binary.
-const char  FW_VERSION_TAG[] = "PANELFW:5.7.0";
+const char  FW_VERSION_TAG[] = "PANELFW:5.7.1";
 const char* FW_VERSION = FW_VERSION_TAG + 8;
 const char* FW_MANIFEST_PATH = "firmware/manifest.json";
 const char* FW_BINARY_PATH   = "firmware/latest.bin";
@@ -461,6 +461,7 @@ void savePhoneSetupPending(bool pending);
 void showFirmwarePortalScreen(const char *message, const char *urlText, const char *hintText);
 void startFirmwareUpgrade();
 void startFirmwareUpdateCheck();
+void pcfScheduleVerify(unsigned long inMs);
 int  doNtfyPublish(const char *suffix, const char *title, const char *message, const char *priority, const char *actions, int timeoutMs = 4000, const char *seq = nullptr, bool click = false);
 void sendPushNotificationEx(const char *title, const char *message, const char *priority, const char *seq, uint32_t clearMs);
 void updateWeatherIconDisplay(bool forceReload = false);
@@ -722,6 +723,8 @@ char             fwCheckSummary[40] = "Not checked yet"; // shown on Diagnostics
 // Diagnostics counters (plain status, no cost in normal operation).
 uint16_t         i2cResetCount   = 0;   // bus re-inits since boot (see i2cBusRecover)
 uint16_t         touchRejectCount = 0;  // touch reads thrown out as impossible (bus noise)
+uint16_t         pcfStateRestores = 0;  // times the relay chip was found holding the wrong outputs and rewritten
+unsigned long    pcfVerifyDueAt   = 0;  // when to next read the relay chip back (0 = nothing scheduled)
 unsigned long    doorbellPausedUntil = 0; // storm guard: bell ignored until this time
 unsigned long    pcfOfflineSince  = 0;   // 0 = responding; else millis() it stopped
 bool             pcfOfflineNotified = false;
@@ -1224,6 +1227,7 @@ void wakeScreen() {
     fadeBacklightTo(getSelectedBrightness());
     screenDimmed = false;
     tickerWakeSyncPending = true;   // updateWeatherTicker() re-phases itself
+    pcfScheduleVerify(300);         // someone is here: make sure the lights match the tiles
   }
 }
 
@@ -1353,6 +1357,9 @@ bool pcfWriteState() {
   if (!ok) {
     lastPcfFailAt = millis();
   }
+  // A relay just switched: if the chip's supply sagged and it reset, that
+  // happened now. Read it back in a quarter of a second (see pcfVerifyOutputs).
+  pcfVerifyDueAt = millis() + 250;
 
   return ok;
 }
@@ -1380,6 +1387,46 @@ void pcfSetPin(uint8_t pin, bool logicalOn) {
   }
 
   pcfWriteState();
+}
+
+// The PCF8574 answers on the bus even after it has quietly reset itself (a
+// dip on its supply when a relay switches is enough): its outputs go to
+// all-high -- every light off -- while pcfState, the UI and the phone still
+// say "on". The next tile press then wrote the stale byte back and switched
+// on the OTHER light. So never trust the copy: read the chip's real output
+// byte and, where it disagrees on a pin we drive, rewrite it. The PCF8574
+// reads back what it drives (a pin we hold low reads 0, a released pin reads
+// 1 through its weak pull-up), so a mismatch means lost state, not noise.
+// Event-driven, not polled, and only while a light is on by hand (see
+// updateSwitchDriverWatch): a read 250 ms after a relay write (the chip
+// resets, if at all, during the switching transient), a read when the
+// screen wakes (someone is there to notice a wrong light), otherwise one a
+// minute. Under motion control or with everything off: no reads. From the
+// UI thread. Returns true if a fix was made.
+void pcfScheduleVerify(unsigned long inMs) {
+  unsigned long at = millis() + inMs;
+  if (pcfVerifyDueAt == 0 || (long)(at - pcfVerifyDueAt) < 0) pcfVerifyDueAt = at;
+}
+
+bool pcfVerifyOutputs() {
+  const uint8_t driven = (1 << PCF_DOORBELL_PIN) | (1 << PCF_PANEL_PIN) |
+                         (1 << PCF_CEILING_PIN)  | (1 << PCF_SPARE_PIN);
+  if (Wire.requestFrom((uint8_t)PCF_ADDR, (uint8_t)1) != 1) return false;
+  int rd = Wire.read();
+  if (rd < 0) return false;
+  uint8_t diff = ((uint8_t)rd ^ pcfState) & driven;
+  if (!diff) return false;
+  bool ok = pcfWriteState();
+  if (pcfStateRestores < 65535) pcfStateRestores++;
+  static unsigned long lastLogAt = 0;
+  if (lastLogAt == 0 || millis() - lastLogAt > 60000UL) {
+    lastLogAt = millis();
+    char d[80];
+    snprintf(d, sizeof(d), "Switch driver had lost its outputs (read %02X, want %02X) - %s",
+             (unsigned)rd, (unsigned)pcfState, ok ? "restored" : "rewrite FAILED");
+    logActivityEvent("I2C", d);
+  }
+  return ok;
 }
 
 void allOutputsOff() {
@@ -4979,10 +5026,28 @@ static void remoteControlTask(void *param) {
 // to respond, and the moment the chip answers again its outputs are
 // rewritten so lights come back to the state the panel intended.
 static void updateSwitchDriverWatch() {
+  if (firmwareUpdateRunning) return;
+
+  // Output read-back, when one is due (see pcfVerifyOutputs for the schedule).
+  // Only while something was switched on BY HAND: a light under motion
+  // control is rewritten on every sensor cycle and heals itself, and when
+  // everything is off there is nothing a chip reset could spoil. In those
+  // states the relay chip is not read at all.
+  bool otherLightOn = (autoLightTarget == AUTO_TARGET_CEILING) ? panelOutputState : ceilingState;
+  bool manualOn = (autoMode == AUTO_MODE_MANUAL_ON) || otherLightOn;
+  if (!manualOn) {
+    pcfVerifyDueAt = 0;
+  } else {
+    if (pcfVerifyDueAt == 0) pcfVerifyDueAt = millis() + 60000UL;   // the slow heartbeat
+    if ((long)(millis() - pcfVerifyDueAt) >= 0) {
+      pcfVerifyDueAt = 0;
+      if (pcfOfflineSince == 0) pcfVerifyOutputs();
+    }
+  }
+
   static unsigned long lastAt = 0;
   if (millis() - lastAt < 20000UL) return;
   lastAt = millis();
-  if (firmwareUpdateRunning) return;
 
   bool wasOnline = (pcfOfflineSince == 0);
   bool nowOnline = pcfIsPresent();
@@ -5063,13 +5128,13 @@ static void updateHealthLog() {
 
   unsigned stackFree = remoteTaskHandle
       ? (unsigned)uxTaskGetStackHighWaterMark(remoteTaskHandle) : 0;
-  char d[96];
-  snprintf(d, sizeof(d), "heap %uK min %uK blk %uK|stk %u|pcf %s|i2c %u tch %u|link %u|wifi %u|push %u/%u(%d)",
+  char d[110];
+  snprintf(d, sizeof(d), "heap %uK min %uK blk %uK|stk %u|pcf %s r%u|i2c %u tch %u|link %u|wifi %u|push %u/%u(%d)",
            (unsigned)(ESP.getFreeHeap() / 1024),
            (unsigned)(ESP.getMinFreeHeap() / 1024),
            (unsigned)(ESP.getMaxAllocHeap() / 1024),
            stackFree,
-           pcfOnline ? "ok" : "FAIL",
+           pcfOnline ? "ok" : "FAIL", (unsigned)pcfStateRestores,
            (unsigned)i2cResetCount, (unsigned)touchRejectCount,
            (unsigned)statListenerReconnects, (unsigned)statWifiReconnects,
            (unsigned)statPushOk, (unsigned)statPushFail, statPushLastFailCode);
@@ -5795,9 +5860,10 @@ static void processRemoteCommand() {
       motionRearmAfterManualOffClear = true;
       applyAutoOutput(false);
       updateAutoLightUI();
-      updateStatus("Status: Lights OFF (remote)");
-      logActivityEvent("REMOTE", "Lights switched off remotely");
-      sendRemoteReply("Lights off. Motion sensing is back in charge.");
+      pcfSetPin(PCF_SPARE_PIN, false);       // "All off" means every switched output
+      updateStatus("Status: All OFF (remote)");
+      logActivityEvent("REMOTE", "All outputs switched off remotely");
+      sendRemoteReply("All off. Motion sensing is back in charge.");
       queueStateReply();
       break;
     }
@@ -5893,7 +5959,7 @@ static void processRemoteCommand() {
     case RCMD_HELP: {
       sendRemoteReply(
         "Send me a word:\n"
-        "on / off = all lights\n"
+        "off = everything off, on = all lights\n"
         "on 1, off 2 = one light by number\n"
         "name 1 Porch Light = rename a light\n"
         "status = how I'm doing\n"
@@ -7597,8 +7663,12 @@ void showProdDiagScreen() {
     makeDiagRow(card, "Touch screen",
                 cachedGt911Online ? "Working" : "Check connection",
                 cachedGt911Online ? DIAG_GOOD : DIAG_BAD, R0 + RP);
+    char drvBuf[36];
+    if (!cachedPcfOnline)            snprintf(drvBuf, sizeof(drvBuf), "Not responding, power-cycle");
+    else if (pcfStateRestores == 0)  snprintf(drvBuf, sizeof(drvBuf), "Working");
+    else                             snprintf(drvBuf, sizeof(drvBuf), "Working, %u self-repairs", (unsigned)pcfStateRestores);
     makeDiagRow(card, "Switch driver",
-                cachedPcfOnline ? "Working" : "Not responding, power-cycle",
+                drvBuf,
                 cachedPcfOnline ? DIAG_GOOD : DIAG_BAD, R0 + RP * 2);
 
     // Shared sensor bus: how often it had to be re-initialised. Zero is
