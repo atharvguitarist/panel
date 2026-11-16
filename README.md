@@ -41,6 +41,7 @@ Panel replaces a conventional switchboard anywhere in a home — front door, liv
 - **Doorbell and motion alerts** pushed to every phone in the household
 - **PIN-protected settings** with an on-device recovery path
 - **Activity log** kept for a year on the SD card
+- **Back as you left it** after a power cut or restart — lights that were on by hand come back, one at a time, and only if the power was off for under ten minutes
 
 </td>
 <td width="50%" valign="top">
@@ -221,6 +222,16 @@ The relay is a public service: anyone who knows a topic name can subscribe or pu
 1. Edit `sketch/Panel/Panel.ino` and raise the number in `FW_VERSION_TAG`. **Every upload needs a new version**, even for a one-line change — the build refuses to publish different bytes under a version already published.
 2. Commit. `build.yml` compiles the sketch, reads the version from the binary, writes `firmware/latest.bin`, `manifest.json` and `symbols.txt.gz`, commits them and redeploys Pages.
 3. Panels see the new version on the phone page and update themselves.
+
+**Model configuration** — the SD card prepared for each model carries `/config/panel.txt`:
+
+```
+outputs=4        # 1-8 (8 only without a doorbell)
+bell=1           # 1 = doorbell tile, 0 = none
+name1=Ceiling    # optional factory names
+```
+
+It is read at every boot and applied when it differs, so a customer never meets a setting. On the bench, `setup outputs 4` or `setup bell off` over the phone link does the same and restarts. A unit updated from an earlier release keeps its 2 + doorbell layout until told otherwise.
 
 **Festival dates** — put `config/festivals.txt` in the repository (`key,YYYY-MM-DD,YYYY-MM-DD`, one festival per line). `publish.yml` validates it and panels fetch it when its stamp changes. Navratri and other lunisolar dates come from the panchang, so the file is the single source of truth.
 

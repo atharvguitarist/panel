@@ -179,7 +179,7 @@ const char* PHONE_UI_BASE_URL = "https://atharvguitarist.github.io/panel/";
 // straight out of the uploaded .bin -- change ONLY the number. FW_VERSION
 // points past the tag, so every existing use is unchanged, and because it is
 // used everywhere the linker can never strip the tag from the binary.
-const char  FW_VERSION_TAG[] = "PANELFW:5.8.2";
+const char  FW_VERSION_TAG[] = "PANELFW:5.9.3";
 const char* FW_VERSION = FW_VERSION_TAG + 8;
 const char* FW_MANIFEST_PATH = "firmware/manifest.json";
 const char* FW_BINARY_PATH   = "firmware/latest.bin";
@@ -394,6 +394,8 @@ struct Output {
   uint8_t   pin;                 // PCF8574 pin
   bool      on;
   lv_obj_t *tile, *label, *dot, *badge, *press, *glow[2];
+  lv_obj_t *ring;                // thin gold arc round the dot: the manual-off cooldown running out
+  int16_t   labelW, tileH;       // the tile's real geometry, kept from creation (see updateOutputUI)
   bool      glowShown;           // what the glow animation last settled on
   lv_img_dsc_t iconDsc;
   uint8_t  *iconBuf;
@@ -404,6 +406,20 @@ Output  outputs[MAX_OUTPUTS] = {          // names and pins here are the default
 uint8_t outputCount  = 2;      // 1..MAX_OUTPUTS
 uint8_t motionTarget = 0;      // index of the output the motion sensor drives ("Motion controls")
 bool    bellPresent  = true;   // doorbell tile on the main screen
+
+// ---- Restore after a power cut / restart ----
+// What was switched on BY HAND is remembered in NVS as it changes, and put
+// back after a reboot -- one output at a time, never before the panel is
+// fully up, and after a power cut only if the clock says the power was off
+// for less than RESTORE_MAX_GAP_S (a light left on at 7 pm is not relit at
+// noon after an eight-hour outage). See restoreTick() for the safety rules.
+const unsigned long RESTORE_MAX_GAP_S = 600;    // 10 minutes
+const unsigned long RESTORE_STEP_MS   = 400;    // spacing between outputs
+const unsigned long RESTORE_EARLIEST_MS = 3000; // never before this much uptime
+bool     restorePending  = false;
+uint8_t  restoreMask     = 0;      // outputs that were on by hand (bit per index)
+bool     restoreManualOn = false;  // the motion output was in a manual-on session
+uint32_t restoreSavedAt  = 0;      // epoch when that was saved, 0 if the clock was not ready
 // Pin order for outputs 1..8: ceiling relay, wall relay, then the spare and
 // the free pins. The chime stays on PCF_DOORBELL_PIN whatever the count.
 static const uint8_t OUTPUT_PINS[MAX_OUTPUTS] = { PCF_CEILING_PIN, PCF_PANEL_PIN, PCF_SPARE_PIN, 4, 5, 6, 7, 0 };
@@ -3719,6 +3735,89 @@ static const lv_font_t *fitNameFont(const char *name, int16_t avail, int16_t th)
   return sz.x <= avail ? FONT_26 : FONT_18;
 }
 
+// ---- Bubble: a one-line note that drops in from the top ----
+// Says what a tap just did and when it ends ("Ceiling Glow off. Auto again
+// in 15 s"), holds three seconds, slides back up. ASCII only: the fonts in
+// flash carry no middle dot or dash. Lives on the top layer;
+// its band (y 14..58) is clear of every tile, and it lets touches through.
+// Cream, hairline border, soft shadow, the small Figtree -- the same voice
+// as the phone page. One object, made once, reused.
+static lv_obj_t  *toastBox = nullptr, *toastLabel = nullptr;
+static lv_timer_t *toastTimer = nullptr;
+static const int16_t TOAST_W = 340, TOAST_X = 498 - TOAST_W / 2, TOAST_Y = 14, TOAST_Y_HIDDEN = -64;
+
+static void toastYAnimCb(void *obj, int32_t v) { lv_obj_set_y((lv_obj_t *)obj, v); }
+static void toastHiddenCb(lv_anim_t *a) { (void)a; if (toastBox) lv_obj_add_flag(toastBox, LV_OBJ_FLAG_HIDDEN); }
+static void toastSlide(int16_t to, bool thenHide) {
+  lv_anim_del(toastBox, toastYAnimCb);
+  lv_anim_t a;
+  lv_anim_init(&a);
+  lv_anim_set_var(&a, toastBox);
+  lv_anim_set_exec_cb(&a, toastYAnimCb);
+  lv_anim_set_values(&a, lv_obj_get_y(toastBox), to);
+  lv_anim_set_time(&a, thenHide ? 220 : 280);
+  lv_anim_set_path_cb(&a, thenHide ? lv_anim_path_ease_in : lv_anim_path_ease_out);
+  if (thenHide) lv_anim_set_ready_cb(&a, toastHiddenCb);
+  lv_anim_start(&a);
+}
+static void toastTimerCb(lv_timer_t *t) { (void)t; toastTimer = nullptr; toastSlide(TOAST_Y_HIDDEN, true); }
+
+void showToast(const char *text) {
+  if (!toastBox) {
+    toastBox = lv_obj_create(lv_layer_top());
+    lv_obj_remove_style_all(toastBox);
+    lv_obj_set_size(toastBox, TOAST_W, LV_SIZE_CONTENT);
+    lv_obj_set_pos(toastBox, TOAST_X, TOAST_Y_HIDDEN);
+    lv_obj_set_style_bg_color(toastBox, lv_color_hex(0xFFFDF6), 0);
+    lv_obj_set_style_bg_opa(toastBox, 255, 0);
+    lv_obj_set_style_border_color(toastBox, lv_color_hex(0xE3D8B8), 0);
+    lv_obj_set_style_border_width(toastBox, 1, 0);
+    lv_obj_set_style_radius(toastBox, 22, 0);
+    lv_obj_set_style_pad_hor(toastBox, 18, 0);
+    lv_obj_set_style_pad_ver(toastBox, 11, 0);
+    lv_obj_set_style_shadow_width(toastBox, 22, 0);
+    lv_obj_set_style_shadow_ofs_y(toastBox, 6, 0);
+    lv_obj_set_style_shadow_color(toastBox, lv_color_hex(0x3D3830), 0);
+    lv_obj_set_style_shadow_opa(toastBox, 42, 0);
+    lv_obj_clear_flag(toastBox, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(toastBox, LV_OBJ_FLAG_SCROLLABLE);
+    toastLabel = lv_label_create(toastBox);
+    lv_label_set_long_mode(toastLabel, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(toastLabel, TOAST_W - 36);
+    lv_obj_set_style_text_align(toastLabel, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(toastLabel, FONT_18, 0);
+    lv_obj_set_style_text_color(toastLabel, lv_color_hex(0x3D3830), 0);
+  }
+  lv_label_set_text(toastLabel, text);
+  if (lv_obj_has_flag(toastBox, LV_OBJ_FLAG_HIDDEN)) {
+    lv_obj_set_y(toastBox, TOAST_Y_HIDDEN);
+    lv_obj_clear_flag(toastBox, LV_OBJ_FLAG_HIDDEN);
+    toastSlide(TOAST_Y, false);
+  }
+  if (toastTimer) lv_timer_reset(toastTimer);
+  else { toastTimer = lv_timer_create(toastTimerCb, 3200, nullptr); lv_timer_set_repeat_count(toastTimer, 1); }
+}
+
+// How the manual-off cooldown reads, for the bubble: "15 s" or "2 min".
+static void cooldownText(char *out, size_t n) {
+  unsigned long sec = autoManualOffCooldownMs / 1000UL;
+  if (sec >= 60) snprintf(out, n, "%lu min", sec / 60); else snprintf(out, n, "%lu s", sec);
+}
+
+// loop(): the ring empties as the cooldown runs. Four updates a second,
+// only while a cooldown is actually running; nothing otherwise.
+static void updateManualOffRing() {
+  if (autoMode != AUTO_MODE_MANUAL_OFF || autoManualOffStartedAt == 0) return;
+  static unsigned long lastAt = 0;
+  if (millis() - lastAt < 250) return;
+  lastAt = millis();
+  lv_obj_t *ring = outputs[motionTarget].ring;
+  if (!ring) return;
+  unsigned long gone = millis() - autoManualOffStartedAt;
+  int16_t left = gone >= autoManualOffCooldownMs ? 0 : (int16_t)(100 - (gone * 100UL) / autoManualOffCooldownMs);
+  lv_arc_set_value(ring, left);
+}
+
 // ---- One update path for every tile ----
 static void updateOutputUI(uint8_t i) {
   if (i >= outputCount) return;
@@ -3727,7 +3826,11 @@ static void updateOutputUI(uint8_t i) {
 
   if (o.label) {
     lv_label_set_text(o.label, o.name);
-    lv_obj_set_style_text_font(o.label, fitNameFont(o.name, lv_obj_get_width(o.label), lv_obj_get_height(o.tile)), 0);
+    // The geometry stored at creation, not lv_obj_get_width(): LVGL works
+    // out object sizes lazily, so right after the screen is built every
+    // width reads 0 -- which picked the small font on every boot until the
+    // first tap re-ran this after a layout pass.
+    lv_obj_set_style_text_font(o.label, fitNameFont(o.name, o.labelW, o.tileH), 0);
   }
   if (o.tile) styleTileActive(o.tile, o.on);
 
@@ -3754,13 +3857,25 @@ static void updateOutputUI(uint8_t i) {
     }
   }
 
+  // The motion light wears its mode: A while the sensor is in charge (so
+  // the owner can see at a glance which light is the automatic one), M
+  // during a manual-on session. A manual-off cooldown shows no letter --
+  // the ring round the dot emptying says it is temporary.
   if (o.badge) {
-    if (i == motionTarget) {
-      lv_label_set_text(o.badge, autoMode == AUTO_MODE_AUTO ? "A" : "M");
-      lv_obj_set_style_text_opa(o.badge, autoMode == AUTO_MODE_AUTO ? 190 : 240, 0);
+    if (i == motionTarget && autoMode == AUTO_MODE_AUTO) {
+      lv_label_set_text(o.badge, "A");
+      lv_obj_set_style_text_opa(o.badge, 190, 0);
+    } else if (i == motionTarget && autoMode == AUTO_MODE_MANUAL_ON) {
+      lv_label_set_text(o.badge, "M");
+      lv_obj_set_style_text_opa(o.badge, 240, 0);
     } else {
-      lv_obj_set_style_text_opa(o.badge, 0, 0);     // a plain manual light: no A/M badge
+      lv_obj_set_style_text_opa(o.badge, 0, 0);
     }
+  }
+  if (o.ring) {
+    bool showRing = (i == motionTarget) && (autoMode == AUTO_MODE_MANUAL_OFF);
+    if (showRing) { lv_arc_set_value(o.ring, 100); lv_obj_clear_flag(o.ring, LV_OBJ_FLAG_HIDDEN); }
+    else lv_obj_add_flag(o.ring, LV_OBJ_FLAG_HIDDEN);
   }
 
   setStateDot(o.dot, o.on);
@@ -3782,6 +3897,30 @@ void applyAutoOutput(bool on) {
 
 void updateAutoLightUI() { updateOutputUI(motionTarget); }
 
+// Remember what is on by hand (not what the motion sensor is doing), so a
+// reboot can put it back. Written only when it changes: a handful of NVS
+// writes a day, well inside the flash's wear budget.
+static void saveRestoreState() {
+  if (restorePending) return;               // mid-restore: keep the full saved set until it is all back
+  uint8_t mask = 0;
+  for (uint8_t i = 0; i < outputCount; i++)
+    if (i != motionTarget && outputs[i].on) mask |= (1 << i);
+  bool manual = (autoMode == AUTO_MODE_MANUAL_ON);
+  static int lastMask = -1, lastManual = -1;
+  static unsigned long lastStampAt = 0;
+  bool changed = (mask != lastMask) || ((int)manual != lastManual);
+  // Re-stamp the time now and then even when nothing changed, so the "how
+  // long was the power off" test after a cut compares against a fresh time.
+  if (!changed && (mask == 0 && !manual)) return;
+  if (!changed && millis() - lastStampAt < 15UL * 60UL * 1000UL) return;
+  lastMask = mask; lastManual = manual; lastStampAt = millis();
+  prefs.begin("doorpanel", false);
+  prefs.putUChar("rstMask", mask);
+  prefs.putUChar("rstMan", manual ? 1 : 0);
+  prefs.putUInt("rstAt", isTimeReadyFast() ? (uint32_t)time(nullptr) : 0);
+  prefs.end();
+}
+
 // Switch one output by hand (tile tap, phone). The motion output gets the
 // manual-session treatment; any other is a plain switch.
 static void setOutputManual(uint8_t i, bool on) {
@@ -3789,6 +3928,89 @@ static void setOutputManual(uint8_t i, bool on) {
   outputs[i].on = on;
   pcfSetPin(outputs[i].pin, on);
   updateOutputUI(i);
+  saveRestoreState();
+}
+
+// Boot: decide whether anything is to be put back. Nothing is switched here;
+// restoreTick() does that from loop(), under its own rules.
+static void planRestoreAfterBoot() {
+  esp_reset_reason_t r = esp_reset_reason();
+  bool crash = (r == ESP_RST_PANIC || r == ESP_RST_INT_WDT || r == ESP_RST_TASK_WDT || r == ESP_RST_WDT);
+  prefs.begin("doorpanel", true);
+  restoreMask     = prefs.getUChar("rstMask", 0);
+  restoreManualOn = prefs.getUChar("rstMan", 0) != 0;
+  restoreSavedAt  = prefs.getUInt("rstAt", 0);
+  prefs.end();
+  if (restoreMask == 0 && !restoreManualOn) return;
+  if (crash) { logActivityEvent("POWER", "Lights not restored after a crash restart"); return; }
+  restorePending = true;
+}
+
+// loop(): the restore itself. The rules, in order:
+//   1. never before RESTORE_EARLIEST_MS of uptime, and never until the relay
+//      chip has answered on the bus -- the rails and the expander must have
+//      settled; every output is OFF until then (the chip powers up that way,
+//      and allOutputsOff() wrote it so again at boot);
+//   2. after a power cut, only once the clock is known and says the power
+//      was off for under RESTORE_MAX_GAP_S; no clock within 90 s means no
+//      restore (a plain restart -- update, remote restart -- needs no clock:
+//      the gap is seconds);
+//   3. one output per RESTORE_STEP_MS, through the same pcfSetPin() path a
+//      tile tap uses -- never two relays in the same instant.
+static void restoreTick() {
+  if (!restorePending) return;
+  if (millis() < RESTORE_EARLIEST_MS) return;
+  static bool chipChecked = false;
+  if (!chipChecked) { if (!pcfIsPresent()) return; chipChecked = true; }
+
+  static bool gapChecked = false;
+  if (!gapChecked) {
+    esp_reset_reason_t r = esp_reset_reason();
+    bool powerCut = (r == ESP_RST_POWERON || r == ESP_RST_BROWNOUT || r == ESP_RST_UNKNOWN);
+    if (powerCut) {
+      if (!isTimeReadyFast()) {
+        if (millis() > 90000UL) { restorePending = false; logActivityEvent("POWER", "Lights not restored: no clock to tell how long the power was off"); }
+        return;
+      }
+      uint32_t now = (uint32_t)time(nullptr);
+      if (restoreSavedAt == 0 || now < restoreSavedAt || now - restoreSavedAt > RESTORE_MAX_GAP_S) {
+        char d[80];
+        if (restoreSavedAt == 0 || now < restoreSavedAt) snprintf(d, sizeof(d), "Lights not restored: outage length unknown");
+        else snprintf(d, sizeof(d), "Lights not restored: power was off for %lu min", (unsigned long)((now - restoreSavedAt) / 60));
+        logActivityEvent("POWER", d);
+        restorePending = false;
+        return;
+      }
+    }
+    gapChecked = true;
+  }
+
+  static unsigned long lastStepAt = 0;
+  static uint8_t idx = 0;
+  static char done[96] = "";
+  if (lastStepAt != 0 && millis() - lastStepAt < RESTORE_STEP_MS) return;
+  while (idx < outputCount) {
+    uint8_t i = idx++;
+    bool wantOn = (i == motionTarget) ? restoreManualOn : ((restoreMask >> i) & 1);
+    if (!wantOn) continue;
+    if (i == motionTarget) {
+      autoMode = AUTO_MODE_MANUAL_ON;
+      autoManualStartedAt = millis();
+      autoManualOffStartedAt = 0;
+      applyAutoOutput(true);
+      updateAutoLightUI();
+    } else {
+      setOutputManual(i, true);
+    }
+    size_t n = strlen(done);
+    snprintf(done + n, sizeof(done) - n, "%s%s", n ? ", " : "", outputs[i].name);
+    lastStepAt = millis();
+    return;                                   // one output per tick
+  }
+  restorePending = false;
+  char d[128];
+  snprintf(d, sizeof(d), "Restored after %s: %s", esp_reset_reason() == ESP_RST_SW ? "restart" : "power cut", done[0] ? done : "nothing");
+  logActivityEvent("POWER", d);
 }
 
 void updateStatus(const char *text) {
@@ -3860,6 +4082,7 @@ void adminAllOffCb(lv_event_t *e) {
   wakeScreen();
   allOutputsOff();
   updateAllOutputUI();
+  saveRestoreState();
   updateStatus("Admin: All outputs OFF");
 }
 
@@ -3870,7 +4093,6 @@ void adminReconnectWiFiCb(lv_event_t *e) {
   reconnectWiFi();
   updateStatus("Admin: Reconnecting WiFi");
 }
-
 
 
 void adminRestartCb(lv_event_t *e) {
@@ -3961,6 +4183,9 @@ void doorbellCb(lv_event_t *e) {
 // whichever tile (ceiling or panel) is currently assigned as the motion-
 // controlled light. See motionTarget / applyAutoOutput / updateAutoLightUI.
 void handleAutoLightTap() {
+  char note[72];
+  const char *nm = outputs[motionTarget].name;
+  const char *till = (weatherHasSunTimes && sunriseEpoch > 0) ? "until sunrise" : "until morning";
   if (autoMode == AUTO_MODE_AUTO) {
     // Manual ON: keep the light ON until the user turns it off or the
     // safety timer expires.
@@ -3969,6 +4194,7 @@ void handleAutoLightTap() {
     autoManualOffStartedAt = 0;
     applyAutoOutput(true);
     updateStatus("Status: Auto light manual ON");
+    snprintf(note, sizeof(note), "%s on %s", nm, till);
   } else if (autoMode == AUTO_MODE_MANUAL_ON) {
     autoMode = AUTO_MODE_MANUAL_OFF;
     autoManualStartedAt = 0;
@@ -3981,6 +4207,9 @@ void handleAutoLightTap() {
 
     applyAutoOutput(false);
     updateStatus("Status: Auto light manual OFF");
+    char cd[16];
+    cooldownText(cd, sizeof(cd));
+    snprintf(note, sizeof(note), "%s off. Auto again in %s", nm, cd);
   } else {
     // Manual OFF -> Manual ON
     autoMode = AUTO_MODE_MANUAL_ON;
@@ -3989,9 +4218,12 @@ void handleAutoLightTap() {
     autoManualOffStartedAt = 0;
     applyAutoOutput(true);
     updateStatus("Status: Auto light manual ON");
+    snprintf(note, sizeof(note), "%s on %s", nm, till);
   }
 
   updateAutoLightUI();
+  saveRestoreState();
+  showToast(note);
 }
 
 // One callback for every output tile; the tile tells us which output.
@@ -4729,6 +4961,7 @@ enum RemoteCommand : uint8_t {
   RCMD_VERSION,   // silent: the phone page asking for version + light state
   RCMD_LIGHT_ON, RCMD_LIGHT_OFF,       // one output by number ("on 3"); the digit is pendingRemoteArg[0]
   RCMD_NAME,      // "name 1 Porch Light": rename an output (digit + text in pendingRemoteArg)
+  RCMD_SETUP,     // installer: "setup outputs 4" / "setup bell off" -> NVS, restart (pendingRemoteArg: "o4" / "b0")
   RCMD_UNKNOWN
 };
 
@@ -4813,6 +5046,16 @@ static void remoteHandleStreamLine(const char *line, time_t minTime) {
     pendingRemoteArg[n + 1] = '\0';
     pendingRemoteCommand = RCMD_NAME;
     return;
+  }
+
+  // Installer-only: "setup outputs N" / "setup bell on|off". Not in help.
+  if (strncmp(cmd, "setup outputs ", 14) == 0 && cmd[14] >= '1' && cmd[14] <= '8' && cmd[15] == '\0') {
+    pendingRemoteArg[0] = 'o'; pendingRemoteArg[1] = cmd[14]; pendingRemoteArg[2] = '\0';
+    pendingRemoteCommand = RCMD_SETUP; return;
+  }
+  if (strcmp(cmd, "setup bell on") == 0 || strcmp(cmd, "setup bell off") == 0) {
+    pendingRemoteArg[0] = 'b'; pendingRemoteArg[1] = (cmd[11] == 'n') ? '1' : '0'; pendingRemoteArg[2] = '\0';
+    pendingRemoteCommand = RCMD_SETUP; return;
   }
 
   // Exact matches, checked first: the phone page sends these.
@@ -5736,6 +5979,7 @@ static void remoteSetLight(uint8_t which, bool on) {
       applyAutoOutput(false);
     }
     updateAutoLightUI();
+    saveRestoreState();
   } else {
     setOutputManual(i, on);
   }
@@ -5841,6 +6085,7 @@ static void processRemoteCommand() {
       updateStatus("Status: All OFF (remote)");
       logActivityEvent("REMOTE", "All outputs switched off remotely");
       sendRemoteReply("All off. Motion sensing is back in charge.");
+      saveRestoreState();
       queueStateReply();
       break;
     }
@@ -5859,6 +6104,7 @@ static void processRemoteCommand() {
       updateStatus("Status: Lights ON (remote)");
       logActivityEvent("REMOTE", "Lights switched on remotely");
       sendRemoteReply("Lights on. They stay on until you say otherwise, or sunrise.");
+      saveRestoreState();
       queueStateReply();
       break;
     }
@@ -5878,6 +6124,27 @@ static void processRemoteCommand() {
       }
       sendRemoteReply(msg);
       queueStateReply();
+      break;
+    }
+
+    case RCMD_SETUP: {
+      char msg[80];
+      prefs.begin("doorpanel", false);
+      if (pendingRemoteArg[0] == 'o') {
+        uint8_t n = pendingRemoteArg[1] - '0';
+        if (n == 8 && bellPresent) n = 7;
+        prefs.putUChar("nout", n);
+        if (motionTarget >= n) prefs.putUChar("autoTgt", 0);
+        snprintf(msg, sizeof(msg), "Configured: %u outputs. Restarting to apply.", (unsigned)n);
+      } else {
+        bool b = pendingRemoteArg[1] == '1';
+        prefs.putUChar("bell", b ? 1 : 0);
+        snprintf(msg, sizeof(msg), "Configured: %s. Restarting to apply.", b ? "doorbell on" : "no doorbell");
+      }
+      prefs.end();
+      logActivityEvent("SETUP", msg);
+      sendRemoteReply(msg);
+      pendingRemoteRestartAt = millis() + 2500;
       break;
     }
 
@@ -6454,10 +6721,32 @@ void createMainUI() {
     lv_obj_set_style_text_color(o.label, lv_color_hex(0x1B0505), 0);
     lv_obj_set_style_text_font(o.label, FONT_26, 0);
     lv_obj_set_width(o.label, r.w - 28);
+    o.labelW = r.w - 28;
+    o.tileH  = r.h;
     lv_obj_set_style_text_align(o.label, LV_TEXT_ALIGN_RIGHT, 0);
     lv_obj_set_pos(o.label, d->lx, r.h - d->lyFromBottom);
 
     o.dot = createStateDot(o.tile, r.w - 31, 16);
+
+    // Cooldown ring: 27 px arc centred on the 13 px dot, gold, no knob.
+    o.ring = lv_arc_create(o.tile);
+    lv_obj_remove_style_all(o.ring);
+    lv_obj_remove_style(o.ring, NULL, LV_PART_KNOB);
+    lv_obj_set_size(o.ring, 27, 27);
+    lv_obj_set_pos(o.ring, r.w - 38, 9);
+    lv_arc_set_rotation(o.ring, 270);
+    lv_arc_set_bg_angles(o.ring, 0, 360);
+    lv_arc_set_range(o.ring, 0, 100);
+    lv_arc_set_value(o.ring, 100);
+    lv_obj_set_style_arc_width(o.ring, 3, LV_PART_MAIN);
+    lv_obj_set_style_arc_color(o.ring, lv_color_hex(0xC9A85C), LV_PART_MAIN);
+    lv_obj_set_style_arc_opa(o.ring, 55, LV_PART_MAIN);
+    lv_obj_set_style_arc_width(o.ring, 3, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(o.ring, lv_color_hex(0xC9A85C), LV_PART_INDICATOR);
+    lv_obj_set_style_arc_rounded(o.ring, true, LV_PART_INDICATOR);
+    lv_obj_clear_flag(o.ring, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(o.ring, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(o.ring, LV_OBJ_FLAG_HIDDEN);
 
     o.badge = lv_label_create(o.tile);
     lv_label_set_text(o.badge, "A");
@@ -6540,22 +6829,6 @@ lv_obj_t *createRebootButton(lv_obj_t *parent, int x, int y, lv_event_cb_t cb) {
   return btn;
 }
 
-lv_obj_t *createBrightnessButton(lv_obj_t *parent, int x, int y) {
-  lv_obj_t *btn = lv_btn_create(parent);
-  lv_obj_set_pos(btn, x, y);
-  lv_obj_set_size(btn, 155, 46);
-  lv_obj_set_style_radius(btn, 16, 0);
-  lv_obj_set_style_bg_color(btn, lv_color_hex(0x222222), 0);
-  lv_obj_add_event_cb(btn, adminBrightnessCb, LV_EVENT_CLICKED, NULL);
-
-  brightnessBtnLabel = lv_label_create(btn);
-  updateBrightnessButtonText();
-  lv_obj_set_style_text_color(brightnessBtnLabel, lv_color_hex(0xFFFFFF), 0);
-  lv_obj_set_style_text_font(brightnessBtnLabel, FONT_18, 0);
-  lv_obj_center(brightnessBtnLabel);
-
-  return btn;
-}
 
 void updateDiagHardwareCache(bool force = false) {
   if (!force && millis() - lastDiagHardwarePollAt < 10000UL) {
@@ -9581,6 +9854,11 @@ void updateAutoLightManualHoldTimer() {
 
       applyAutoOutput(false);
       updateAutoLightUI();
+      if (!screenDimmed) {
+        char note[48];
+        snprintf(note, sizeof(note), "%s back on Auto", outputs[motionTarget].name);
+        showToast(note);
+      }
     }
 
     return;
@@ -9597,6 +9875,7 @@ void updateAutoLightManualHoldTimer() {
 
     applyAutoOutput(shouldBeOn);
     updateAutoLightUI();
+    saveRestoreState();
   }
 }
 
@@ -9638,6 +9917,61 @@ static void reportCrashNote() {
   snprintf(d, sizeof(d), "core %d %s PC %08x RA %08x %s",
            crashNote.core, crashNote.reason, (unsigned)crashNote.pc, (unsigned)crashNote.ra, crashNote.desc);
   logActivityEvent("CRASH", d);
+}
+
+// ---- Factory configuration from the card: /config/panel.txt ----
+// The card is prepared per model anyway (icons, festival dates), so the
+// output count and the doorbell choice ride along:
+//     outputs=4
+//     bell=1
+//     name1=Ceiling Lights        (optional factory names)
+// Read at every boot; applied and saved to NVS when it differs. The customer
+// never sees a setting. Installers can also say "setup outputs 4" over the
+// phone link, which does the same and restarts.
+static void applySdPanelConfig() {
+  if (!sdMounted || !SD.exists("/config/panel.txt")) return;
+  File f = SD.open("/config/panel.txt", FILE_READ);
+  if (!f) return;
+  uint8_t nout = outputCount; bool bell = bellPresent; bool namesChanged = false;
+  char line[64];
+  while (f.available()) {
+    size_t n = f.readBytesUntil('\n', line, sizeof(line) - 1);
+    line[n] = '\0';
+    while (n && (line[n - 1] == '\r' || line[n - 1] == ' ')) line[--n] = '\0';
+    if (!n || line[0] == '#') continue;
+    char *eq = strchr(line, '=');
+    if (!eq) continue;
+    *eq = '\0';
+    const char *key = line, *val = eq + 1;
+    while (*val == ' ') val++;
+    if (strcmp(key, "outputs") == 0)   { int v = atoi(val); if (v >= 1 && v <= MAX_OUTPUTS) nout = (uint8_t)v; }
+    else if (strcmp(key, "bell") == 0) { bell = (atoi(val) != 0 || strcmp(val, "yes") == 0 || strcmp(val, "on") == 0); }
+    else if (strncmp(key, "name", 4) == 0 && key[4] >= '1' && key[4] <= '8' && key[5] == '\0') {
+      uint8_t i = key[4] - '1';
+      if (*val && strncmp(outputs[i].name, val, LIGHT_NAME_MAX) != 0) {
+        strncpy(outputs[i].name, val, LIGHT_NAME_MAX); outputs[i].name[LIGHT_NAME_MAX] = '\0';
+        char k[8]; snprintf(k, sizeof(k), "name%u", (unsigned)(i + 1));
+        prefs.begin("doorpanel", false); prefs.putString(k, outputs[i].name); prefs.end();
+        namesChanged = true;
+      }
+    }
+  }
+  f.close();
+  if (nout == 8 && bell) nout = 7;
+  if (nout != outputCount || bell != bellPresent) {
+    outputCount = nout; bellPresent = bell;
+    if (motionTarget >= outputCount) motionTarget = 0;
+    prefs.begin("doorpanel", false);
+    prefs.putUChar("nout", outputCount);
+    prefs.putUChar("bell", bellPresent ? 1 : 0);
+    prefs.putUChar("autoTgt", motionTarget);
+    prefs.end();
+    char d[72];
+    snprintf(d, sizeof(d), "Configured from card: %u outputs, %s", (unsigned)outputCount, bellPresent ? "doorbell" : "no doorbell");
+    logActivityEvent("SETUP", d);
+  } else if (namesChanged) {
+    logActivityEvent("SETUP", "Light names set from card");
+  }
 }
 
 // ---- Boot-loop rollback: the shipped-product safety net ----
@@ -9738,6 +10072,7 @@ void setup() {
   reportCrashNote();
   reportInterruptedUpdate();
   checkBootLoopRollback();
+  applySdPanelConfig();
 
   // ---- Boot-attempt counter ----
   // Counts setup() calls that never reach markBootSuccessful() at the end of
@@ -9854,6 +10189,7 @@ void setup() {
   createMainUI();
 
   fadeInScreen(mainScreen);
+  planRestoreAfterBoot();
 
   // Mint this unit's notification topic if it has none. Runs after
   // createMainUI() so logActivityEvent() has a live UI/SD context, and does
@@ -9891,6 +10227,7 @@ void loop() {
 
   checkWelcomeOverlayTrigger();
   updateAutoLightManualHoldTimer();
+  updateManualOffRing();
   updateAutoLightManualOnReminder();
   updateNightDisplaySleepTransition();
   updateFactoryResetArmTimeout();
@@ -9903,6 +10240,7 @@ void loop() {
   updateHealthLog();
   updateLogRetention();
   bootHealthyTick();
+  restoreTick();
   updateSwitchDriverWatch();
   updateWeatherTicker();
   updateBacklightFade();
