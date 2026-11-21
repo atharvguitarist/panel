@@ -179,7 +179,7 @@ const char* PHONE_UI_BASE_URL = "https://atharvguitarist.github.io/panel/";
 // straight out of the uploaded .bin -- change ONLY the number. FW_VERSION
 // points past the tag, so every existing use is unchanged, and because it is
 // used everywhere the linker can never strip the tag from the binary.
-const char  FW_VERSION_TAG[] = "PANELFW:5.9.8";
+const char  FW_VERSION_TAG[] = "PANELFW:5.9.9";
 const char* FW_VERSION = FW_VERSION_TAG + 8;
 const char* FW_MANIFEST_PATH = "firmware/manifest.json";
 const char* FW_BINARY_PATH   = "firmware/latest.bin";
@@ -440,11 +440,11 @@ struct WeatherResult {
   long rainAt;
 };
 // Outcome of a ranged HTTPS download (httpsRangedDownload).
-struct DlStats { int lastCode, attempts, reconnects; unsigned long ms; };
+struct DlStats { int lastCode, attempts, reconnects, fullRestarts; unsigned long ms; };
 // One file the repo wants on the card (from firmware/assets.txt).
 struct AssetEntry { char path[64]; uint32_t size; char md5[33]; bool ok; };
 // What a toast is about: a light switched on, off (cooldown), or back to automatic.
-enum ToastKind : uint8_t { TOAST_ON, TOAST_OFF, TOAST_AUTO };
+enum ToastKind : uint8_t { TOAST_ON, TOAST_OFF, TOAST_AUTO, TOAST_PROGRESS };
 
 bool doorbellActive = false;
 unsigned long doorbellStartedAt = 0;
@@ -734,7 +734,10 @@ bool firmwareUploadPortalActive = false;
 // Update-from-GitHub state. Written by the core-0 worker, consumed by loop().
 volatile bool    firmwareDownloadActive = false;  // listener stands down while true
 volatile bool    fwStaging              = false;  // loop() is flashing the image: no TLS, no pushes
-char             fwDownloadStats[96]     = "";     // "Download: 1286 KB in 48 s, 21 requests, 2 reconnects" for the log
+char             fwDownloadStats[110]   = "";     // "Download: 1286 KB in 48 s, 3 requests, 2 reconnects, 0 restarts" for the log
+unsigned long    fwInstallPendingAt     = 0;      // a verified update is waiting for a quiet moment to install
+bool             fwInstallNow           = false;  // the phone asked again: install at once
+bool             fwInstallToldTonight   = false;  // the pill already says "installs tonight"
 volatile uint8_t firmwareDownloadPct    = 0;
 volatile uint8_t firmwareUpdateResult   = 0;      // 0 none, see FWR_* below
 char             firmwareUpdateVersion[16] = "";  // version found by check/download
@@ -3929,8 +3932,13 @@ static const lv_font_t *fitNameFont(const char *name, int16_t avail, int16_t th)
 //   [dot]  Ceiling Glow   On until sunrise
 // Fades and drifts in (260 ms), holds 3 s, fades up and out. Main screen
 // only; lets touches through. One object, made once, reused.
-static lv_obj_t  *toastBox = nullptr, *toastDot = nullptr, *toastName = nullptr, *toastText = nullptr;
+static lv_obj_t  *toastBox = nullptr, *toastDot = nullptr, *toastRing = nullptr, *toastName = nullptr, *toastText = nullptr;
 static lv_timer_t *toastTimer = nullptr;
+// A progress pill (the update downloading) stays up while it runs; a tap's
+// note borrows the spot for its three seconds and then hands it back.
+static bool toastSticky = false;
+static char toastStickyName[20] = "", toastStickyText[32] = "";
+static int8_t toastStickyPct = 0;
 
 // Each theme's accent colour. Unknown keys and ordinary days: the house gold.
 struct ThemeAccentEntry { const char *key; uint32_t rgb; };
@@ -3980,7 +3988,12 @@ static void toastAnimate(bool in) {
   if (!in) lv_anim_set_ready_cb(&a, toastHiddenCb);
   lv_anim_start(&a);
 }
-static void toastTimerCb(lv_timer_t *t) { (void)t; toastTimer = nullptr; toastAnimate(false); }
+void showToast(const char *name, const char *text, ToastKind kind);
+static void toastTimerCb(lv_timer_t *t) {
+  (void)t; toastTimer = nullptr;
+  if (toastSticky) showToast(toastStickyName, toastStickyText, TOAST_PROGRESS);   // back to the progress pill
+  else toastAnimate(false);
+}
 
 static lv_obj_t *toastLabel(lv_obj_t *parent, uint32_t color) {
   lv_obj_t *l = lv_label_create(parent);
@@ -4013,6 +4026,21 @@ void showToast(const char *name, const char *text, ToastKind kind) {
     lv_obj_set_size(toastDot, 9, 9);
     lv_obj_set_style_radius(toastDot, LV_RADIUS_CIRCLE, 0);
 
+    // Progress ring (update download): an 18 px arc where the dot sits.
+    toastRing = lv_arc_create(toastBox);
+    lv_obj_remove_style_all(toastRing);
+    lv_obj_remove_style(toastRing, NULL, LV_PART_KNOB);
+    lv_obj_set_size(toastRing, 18, 18);
+    lv_arc_set_rotation(toastRing, 270);
+    lv_arc_set_bg_angles(toastRing, 0, 360);
+    lv_arc_set_range(toastRing, 0, 100);
+    lv_obj_set_style_arc_width(toastRing, 3, LV_PART_MAIN);
+    lv_obj_set_style_arc_opa(toastRing, 60, LV_PART_MAIN);
+    lv_obj_set_style_arc_width(toastRing, 3, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_rounded(toastRing, true, LV_PART_INDICATOR);
+    lv_obj_clear_flag(toastRing, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(toastRing, LV_OBJ_FLAG_HIDDEN);
+
     toastName = toastLabel(toastBox, 0x1B0505);
     toastText = toastLabel(toastBox, 0x7C6839);
     lv_obj_add_flag(toastBox, LV_OBJ_FLAG_HIDDEN);
@@ -4041,6 +4069,19 @@ void showToast(const char *name, const char *text, ToastKind kind) {
   lv_obj_set_style_shadow_width(toastDot, kind == TOAST_ON ? 10 : 0, 0);
   lv_obj_set_style_shadow_opa(toastDot, kind == TOAST_ON ? 170 : 0, 0);
 
+  // Progress: the ring replaces the dot and fills with the percentage.
+  bool prog = (kind == TOAST_PROGRESS);
+  if (prog) {
+    lv_obj_add_flag(toastDot, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(toastRing, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_style_arc_color(toastRing, lv_color_hex(acText), LV_PART_MAIN);
+    lv_obj_set_style_arc_color(toastRing, lv_color_hex(acText), LV_PART_INDICATOR);
+    lv_arc_set_value(toastRing, toastStickyPct);
+  } else {
+    lv_obj_clear_flag(toastDot, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(toastRing, LV_OBJ_FLAG_HIDDEN);
+  }
+
   lv_label_set_text(toastName, name);
   lv_label_set_text(toastText, text);
 
@@ -4052,8 +4093,27 @@ void showToast(const char *name, const char *text, ToastKind kind) {
     lv_anim_del(toastBox, toastAnimCb);     // already showing (or leaving): settle it shown
     toastAnimCb(toastBox, 256);
   }
+  if (prog) {
+    // The progress pill never times out; a running note keeps its timer.
+    return;
+  }
   if (toastTimer) lv_timer_reset(toastTimer);
   else { toastTimer = lv_timer_create(toastTimerCb, 3000, nullptr); lv_timer_set_repeat_count(toastTimer, 1); }
+}
+
+// The update's progress pill: shown, refreshed, ended.
+void showProgressPill(const char *name, const char *text, int pct) {
+  toastSticky = true;
+  strncpy(toastStickyName, name, sizeof(toastStickyName) - 1);
+  strncpy(toastStickyText, text, sizeof(toastStickyText) - 1);
+  toastStickyPct = (int8_t)(pct < 0 ? 0 : (pct > 100 ? 100 : pct));
+  if (toastTimer) return;                     // a tap's note is showing: it hands back when done
+  showToast(toastStickyName, toastStickyText, TOAST_PROGRESS);
+}
+void endProgressPill() {
+  if (!toastSticky) return;
+  toastSticky = false;
+  if (!toastTimer && toastBox && !lv_obj_has_flag(toastBox, LV_OBJ_FLAG_HIDDEN)) toastAnimate(false);
 }
 
 // How the manual-off cooldown reads, for the bubble: "15 s" or "2 min".
@@ -5829,21 +5889,22 @@ static void fwCheckTask(void *param) {
 static uint8_t *fwStagedBuf = nullptr;
 static size_t   fwStagedLen = 0;
 
-// RESUMABLE download into PSRAM, in 64 KB Range requests over one kept-
-// alive TLS connection. A wall panel on weak Wi-Fi cannot hold a long
-// stream open -- it stalls, and every stall used to cost a 10 s wait plus
-// a fresh handshake. Short requests bound the damage: a stall loses at most
-// 64 KB of time, the connection is reused while it lives, and progress is
-// never thrown away. The budget is progress, not a count: it stops only
-// after six requests in a row that gained nothing, or fifteen minutes in
-// all. Modem power-save is off for the duration and restored afterwards.
+// RESUMABLE download into PSRAM. Each request asks for everything still
+// missing ("bytes=N-"), so a healthy link is one request end to end; when the
+// link stalls (4 s without a byte) the connection is dropped and the next
+// request picks up at the last byte held -- nothing is ever fetched twice.
+// After a request that made progress the reconnect is immediate; only
+// requests that gained nothing back off. If the CDN ignores Range and sends
+// the whole file mid-way, that is retried twice before being accepted.
+// The budget is progress, not a count: it stops only after six requests in
+// a row that gained nothing, or fifteen minutes in all. Modem power-save is
+// off for the duration and restored afterwards.
 // The caller holds tlsGate. Returns the bytes received.
 static size_t httpsRangedDownload(const char *url, uint8_t *buf, size_t size, volatile uint8_t *pct, DlStats *st) {
-  const size_t CHUNK = 65536;
   const int MAX_IDLE_ATTEMPTS = 6;
   const unsigned long MAX_TOTAL_MS = 15UL * 60UL * 1000UL;
   size_t total = 0;
-  int lastCode = 0, attempts = 0, idle = 0, reconnects = 0;
+  int lastCode = 0, attempts = 0, idle = 0, reconnects = 0, rangeIgnored = 0, fullRestarts = 0;
   unsigned long startedAt = millis();
   bool sleepWas = WiFi.getSleep();
   WiFi.setSleep(false);
@@ -5861,7 +5922,7 @@ static size_t httpsRangedDownload(const char *url, uint8_t *buf, size_t size, vo
     if (WiFi.status() != WL_CONNECTED) { lastCode = -100; idle++; dropConnection(); vTaskDelay(pdMS_TO_TICKS(2000)); continue; }
 
     if (!client) {
-      if (attempts > 1) { reconnects++; vTaskDelay(pdMS_TO_TICKS(1500 + 1500UL * idle)); }
+      if (attempts > 1) { reconnects++; if (idle) vTaskDelay(pdMS_TO_TICKS(1500UL * idle)); }
       client = new WiFiClientSecure();
       client->setInsecure();
       client->setHandshakeTimeout(12);
@@ -5876,13 +5937,17 @@ static size_t httpsRangedDownload(const char *url, uint8_t *buf, size_t size, vo
     if (!http->begin(*client, url)) { lastCode = -101; idle++; dropConnection(); continue; }
 
     size_t want = size - total;
-    if (want > CHUNK) want = CHUNK;
-    char range[48];
-    snprintf(range, sizeof(range), "bytes=%u-%u", (unsigned)total, (unsigned)(total + want - 1));
+    char range[32];
+    snprintf(range, sizeof(range), "bytes=%u-", (unsigned)total);
     http->addHeader("Range", range);
     int code = http->GET();
     lastCode = code;
-    if (code == 200) total = 0;                          // Range ignored: whole file from the start
+    if (code == 200 && total > 0) {
+      // The CDN ignored Range and is sending the whole file. Ask again (a
+      // different edge usually honours it) before starting over.
+      if (++rangeIgnored <= 2) { idle++; dropConnection(); continue; }
+      total = 0; fullRestarts++;
+    }
     if (code != 200 && code != 206) { idle++; dropConnection(); continue; }
 
     WiFiClient *stream = http->getStreamPtr();
@@ -5902,7 +5967,7 @@ static size_t httpsRangedDownload(const char *url, uint8_t *buf, size_t size, vo
         lastDataAt = millis();
       } else {
         if (!http->connected() && stream->available() == 0) break;
-        if (millis() - lastDataAt > 6000UL) break;      // stalled: drop and ask again
+        if (millis() - lastDataAt > 4000UL) break;      // stalled: drop and ask again
         vTaskDelay(pdMS_TO_TICKS(2));
       }
     }
@@ -5912,7 +5977,7 @@ static size_t httpsRangedDownload(const char *url, uint8_t *buf, size_t size, vo
   }
   dropConnection();
   WiFi.setSleep(sleepWas);
-  if (st) { st->lastCode = lastCode; st->attempts = attempts; st->reconnects = reconnects; st->ms = millis() - startedAt; }
+  if (st) { st->lastCode = lastCode; st->attempts = attempts; st->reconnects = reconnects; st->fullRestarts = fullRestarts; st->ms = millis() - startedAt; }
   return total;
 }
 
@@ -5983,8 +6048,8 @@ static void fwUpgradeTask(void *param) {
   int lastCode = ds.lastCode, attempts = ds.attempts, reconnects = ds.reconnects;
   unsigned long startedAt = millis() - ds.ms;
 
-  snprintf(fwDownloadStats, sizeof(fwDownloadStats), "Download: %u KB in %lu s, %d requests, %d reconnects",
-           (unsigned)(total / 1024), (millis() - startedAt) / 1000UL, attempts, reconnects);
+  snprintf(fwDownloadStats, sizeof(fwDownloadStats), "Download: %u KB in %lu s, %d requests, %d reconnects, %d restarts",
+           (unsigned)(total / 1024), (millis() - startedAt) / 1000UL, attempts, reconnects, ds.fullRestarts);
 
   if (total != m.size) {
     free(img);
@@ -6066,18 +6131,24 @@ static bool fwFlashStagedImage() {
 
 void startFirmwareUpgrade() {
   if (firmwareDownloadActive || firmwareUpdateRunning || firmwareUploadPortalActive) return;
+  // Already downloaded and waiting for a quiet moment: asking again from the
+  // phone means "now" -- whoever asks is not standing at the panel.
+  if (fwInstallPendingAt != 0) {
+    fwInstallNow = true;
+    sendRemoteReply("Installing the downloaded update now.");
+    return;
+  }
   if (WiFi.status() != WL_CONNECTED) {
     sendRemoteReply("No Wi-Fi, so I can't download the update right now.");
     return;
   }
-  if (!sdMounted) {
-    sendRemoteReply("SD card isn't ready, so I can't stage the update.");
-    return;
-  }
-  wakeScreen();
-  showFirmwarePortalScreen("", "Downloading update...", "Keep power on.");
+  // No SD card needed: the update goes from RAM straight into flash.
+  // The panel stays in use while the update downloads: a small progress pill
+  // in the corner instead of a full screen. Installing waits until nobody is
+  // using the panel (see updatePendingInstall).
+  showProgressPill("Update", "Starting", 0);
   logActivityEvent("UPDATE", "Download started");
-  sendRemoteReply("Downloading the update. I'll restart to install it.");
+  sendRemoteReply("Downloading the update in the background. The panel keeps working, and installs it when nobody is using it.");
   xTaskCreatePinnedToCore(fwUpgradeTask, "fwUpgrade", 12288, nullptr, 2, nullptr, 0);
 }
 
@@ -6427,15 +6498,15 @@ static void processFirmwareUpdateResults() {
     }
   }
 
-  // Progress while a download runs (coarse: every 10%).
+  // Progress while a download runs: the pill's ring and percentage.
   if (firmwareDownloadActive) {
     static uint8_t shownPct = 255;
     uint8_t pct = firmwareDownloadPct;
-    if (pct / 10 != shownPct / 10) {
+    if (pct != shownPct) {
       shownPct = pct;
-      char m[48];
-      snprintf(m, sizeof(m), "Downloading update... %u%%", (unsigned)pct);
-      showFirmwarePortalScreen("", m, "Keep power on.");
+      char m[24];
+      snprintf(m, sizeof(m), "Downloading %u%%", (unsigned)pct);
+      showProgressPill("Update", m, pct);
     }
     return;
   }
@@ -6506,48 +6577,91 @@ static void processFirmwareUpdateResults() {
       break;
     }
     case FWR_UP_TO_DATE:
+      endProgressPill();
       snprintf(msg, sizeof(msg), "Already up to date (%s). Nothing to do.", FW_VERSION);
       sendRemoteReply(msg);
-      showFirmwarePortalScreen("", "Already up to date", "No newer version published.");
+      showToast("Update", "Already up to date", TOAST_AUTO);
       break;
     case FWR_FAILED:
+      endProgressPill();
       snprintf(msg, sizeof(msg), "Update failed: %s", firmwareUpdateMsg);
       logActivityEvent("UPDATE", msg);
       sendRemoteReply(msg);
-      showFirmwarePortalScreen("", "Update failed", firmwareUpdateMsg);
+      showToast("Update", "Didn't finish, try again", TOAST_OFF);
       break;
     case FWR_DOWNLOADED: {
       if (fwDownloadStats[0]) logActivityEvent("UPDATE", fwDownloadStats);
-      snprintf(msg, sizeof(msg), "Downloaded %s, installing", firmwareUpdateVersion);
+      snprintf(msg, sizeof(msg), "Downloaded %s, installs when idle", firmwareUpdateVersion);
       logActivityEvent("UPDATE", msg);
-      showFirmwarePortalScreen("", "Installing update...", "Screen will turn off for a moment. Keep power on.");
-      lv_timer_handler();                      // show it before the flash writes begin
-      fwStageMark(4);
-      fwStaging = true;                        // radio side stands down for the write
-      vTaskDelay(pdMS_TO_TICKS(600));          // let any TLS already in flight finish first
-      uint8_t bl = getSelectedBrightness();
-      setBacklight(0);                         // flash writes disable the cache; hide the display glitch
-      bool flashed = fwFlashStagedImage();
-      setBacklight(bl);
-      fwStaging = false;
-      if (!flashed) {
-        fwStageMark(0);
-        snprintf(msg, sizeof(msg), "Update failed: %s", firmwareUpdateMsg);
-        logActivityEvent("UPDATE", msg);
-        sendRemoteReply(msg);
-        showFirmwarePortalScreen("", "Update failed", firmwareUpdateMsg);
-        snprintf(fwCheckSummary, sizeof(fwCheckSummary), "Last attempt failed");
-        break;
-      }
-      fwStageMark(5);
-      snprintf(msg, sizeof(msg), "Update %s installed. Restarting, back in about half a minute.",
-               firmwareUpdateVersion);
-      sendRemoteReply(msg);
-      showFirmwarePortalScreen("", "Update installed", "Restarting. Keep power on.");
-      pendingRemoteRestartAt = millis() + 2500;   // let the reply leave first
+      showProgressPill("Update", "Ready, installs when idle", 100);
+      sendRemoteReply(activeFestivalTheme
+        ? "Update downloaded. It's a festival day, so it installs tonight between 3 and 6 when nobody is around. Tap Update again to install now."
+        : "Update downloaded. It installs when nobody is using the panel, or tonight between 3 and 6. Tap Update again to install now.");
+      fwInstallPendingAt = millis();
+      fwInstallToldTonight = false;
       break;
     }
   }
+}
+
+// loop(): install a downloaded update at a quiet moment. Flash writes stop
+// the screen for about ten seconds and the panel restarts afterwards, so it
+// is never done while anyone is around:
+//   * for ten minutes after the download: the first quiet moment (nobody has
+//     touched the panel for 15 s and nobody is at the sensor);
+//   * after that -- and at once on a festival day, when visitors come and go
+//     all day -- only at night, 03:00 to 06:00, at the first quiet moment;
+//     a busy night simply waits for the next one. It is never forced.
+// Asking again from the phone installs right away (fwInstallNow).
+static void updatePendingInstall() {
+  if (fwInstallPendingAt == 0) return;
+  bool quiet = (millis() - lastUserActivityAt > 15000UL) && !motionStableState && assetPhase != 5;
+  if (!fwInstallNow) {
+    if (!quiet) return;
+    bool firstWindow = !activeFestivalTheme && (millis() - fwInstallPendingAt < 10UL * 60UL * 1000UL);
+    if (!firstWindow) {
+      if (isTimeReadyFast()) {
+        struct tm t;
+        getLocalTmFast(&t);
+        if (t.tm_hour < 3 || t.tm_hour >= 6) {
+          if (!fwInstallToldTonight) { fwInstallToldTonight = true; showProgressPill("Update", "Ready, installs tonight", 100); }
+          return;
+        }
+      }
+      // No clock yet: the night rule cannot be applied; a quiet moment will do.
+    }
+  }
+  fwInstallNow = false;
+  fwInstallPendingAt = 0;
+  endProgressPill();
+  char msg[200];
+
+  showFirmwarePortalScreen("", "Installing update...", "Screen will turn off for a moment. Keep power on.");
+  lv_timer_handler();                      // show it before the flash writes begin
+  fwStageMark(4);
+  fwStaging = true;                        // radio side stands down for the write
+  vTaskDelay(pdMS_TO_TICKS(600));          // let any TLS already in flight finish first
+  uint8_t bl = getSelectedBrightness();
+  setBacklight(0);                         // flash writes disable the cache; hide the display glitch
+  bool flashed = fwFlashStagedImage();
+  setBacklight(bl);
+  fwStaging = false;
+  if (!flashed) {
+    fwStageMark(0);
+    snprintf(msg, sizeof(msg), "Update failed: %s", firmwareUpdateMsg);
+    logActivityEvent("UPDATE", msg);
+    sendRemoteReply(msg);
+    snprintf(fwCheckSummary, sizeof(fwCheckSummary), "Last attempt failed");
+    lv_scr_load(mainScreen);               // back to the tiles; the old firmware keeps running
+    showToast("Update", "Didn't install, try again", TOAST_OFF);
+    return;
+  }
+  fwStageMark(5);
+  snprintf(msg, sizeof(msg), "Update %s installed. Restarting, back in about half a minute.",
+           firmwareUpdateVersion);
+  sendRemoteReply(msg);
+  showFirmwarePortalScreen("", "Update installed", "Restarting. Keep power on.");
+  pendingRemoteRestartAt = millis() + 2500;   // let the reply leave first
 }
 
 // ---- One light by number, from the phone ----
@@ -10861,6 +10975,7 @@ void loop() {
   updateAssetRestart();
   bgLoadTick();
   applyWeatherResult();
+  updatePendingInstall();
   updateSwitchDriverWatch();
   updateWeatherTicker();
   updateBacklightFade();
