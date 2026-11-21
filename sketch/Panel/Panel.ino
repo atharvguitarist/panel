@@ -179,7 +179,7 @@ const char* PHONE_UI_BASE_URL = "https://atharvguitarist.github.io/panel/";
 // straight out of the uploaded .bin -- change ONLY the number. FW_VERSION
 // points past the tag, so every existing use is unchanged, and because it is
 // used everywhere the linker can never strip the tag from the binary.
-const char  FW_VERSION_TAG[] = "PANELFW:5.9.9";
+const char  FW_VERSION_TAG[] = "PANELFW:5.9.10";
 const char* FW_VERSION = FW_VERSION_TAG + 8;
 const char* FW_MANIFEST_PATH = "firmware/manifest.json";
 const char* FW_BINARY_PATH   = "firmware/latest.bin";
@@ -348,9 +348,13 @@ const unsigned long NIGHT_SLEEP_IDLE_MS = 180000UL; // 3 minutes
 // D:\sketchbook\libraries\figtree_fonts\figtree_18.c
 // D:\sketchbook\libraries\figtree_fonts\figtree_26.c
 // D:\sketchbook\libraries\figtree_fonts\figtree_30.c
+// D:\sketchbook\libraries\figtree_fonts\panel_symbols_14.c   (settings arrows)
+// D:\sketchbook\libraries\figtree_fonts\panel_symbols_30.c   (doorbell fallback)
 //
-// These keep the exact same UI sizes as the old Montserrat setup.
-// CPU load stays effectively the same; only flash size increases slightly.
+// These keep the exact same UI sizes as the old Montserrat setup. Montserrat
+// itself is no longer compiled in: lv_conf.h makes Figtree 18 the default
+// font, and the three icon glyphs come from panel_symbols_* (cut from
+// Montserrat, identical pixels).
 
 #define FONT_18 &figtree_18
 #define FONT_26 &figtree_26
@@ -7348,7 +7352,7 @@ void createMainUI() {
       bellIcon = lv_label_create(bellTile);
       lv_label_set_text(bellIcon, LV_SYMBOL_BELL);
       lv_obj_set_style_text_color(bellIcon, lv_color_hex(0x111111), 0);
-      lv_obj_set_style_text_font(bellIcon, FONT_30, 0);
+      lv_obj_set_style_text_font(bellIcon, &panel_symbols_30, 0);   // Figtree has no bell glyph
       lv_obj_set_pos(bellIcon, (int16_t)(135 * bf), (int16_t)(145 * bf) + byOff);
     } else if (bf < 0.999f) {
       lv_img_set_pivot(bellIcon, 0, 0);
@@ -9444,6 +9448,7 @@ lv_obj_t *createCycleRow(lv_obj_t *parent, const char *labelText, int y, lv_even
   lv_obj_add_event_cb(leftBtn, cb, LV_EVENT_CLICKED, (void *)(intptr_t)(-1));
   lv_obj_t *leftIcon = lv_label_create(leftBtn);
   lv_label_set_text(leftIcon, LV_SYMBOL_LEFT);
+  lv_obj_set_style_text_font(leftIcon, &panel_symbols_14, 0);   // same glyph Montserrat 14 drew
   lv_obj_set_style_text_color(leftIcon, lv_color_hex(0x999999), 0);
   lv_obj_center(leftIcon);
 
@@ -9456,6 +9461,7 @@ lv_obj_t *createCycleRow(lv_obj_t *parent, const char *labelText, int y, lv_even
   lv_obj_add_event_cb(rightBtn, cb, LV_EVENT_CLICKED, (void *)(intptr_t)(1));
   lv_obj_t *rightIcon = lv_label_create(rightBtn);
   lv_label_set_text(rightIcon, LV_SYMBOL_RIGHT);
+  lv_obj_set_style_text_font(rightIcon, &panel_symbols_14, 0);
   lv_obj_set_style_text_color(rightIcon, lv_color_hex(0x999999), 0);
   lv_obj_center(rightIcon);
 
@@ -9999,6 +10005,7 @@ void showLogsScreen() {
   if (logsScreen) destroyLogsScreen();
 
   logsEntries = (LogRow *)ps_malloc(sizeof(LogRow) * LOGS_MAX_ENTRIES);   // PSRAM: 26KB, only while Logs is open
+  if (!logsEntries) logActivityEvent("HEALTH", "Logs: no PSRAM for the list");  // screen opens empty, as before
   logsReload();
 
   logsScreen = lv_obj_create(NULL);
