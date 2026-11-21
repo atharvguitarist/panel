@@ -1,14 +1,14 @@
 name: Publish release
 
-# Upload Panel_vX.ino.bin into firmware/ (any name) and/or edit
-# config/festivals.txt -- this does the rest: renames the binary to
+# Upload Panel_vX.ino.bin into firmware/ (any name), edit
+# config/festivals.txt, and/or add files under sdcard/ -- this does the rest: renames the binary to
 # latest.bin, reads its version, computes size + md5, validates and stamps
 # the festival calendar, writes firmware/manifest.json, commits it, and
 # redeploys the page. Uses no third-party actions.
 on:
   push:
     branches: [main]
-    paths: ["firmware/**", "config/festivals.txt", "tools/**"]
+    paths: ["firmware/**", "config/festivals.txt", "tools/**", "sdcard/**"]
   workflow_dispatch:
 
 permissions:
