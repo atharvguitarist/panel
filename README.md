@@ -233,6 +233,19 @@ name1=Ceiling    # optional factory names
 
 It is read at every boot and applied when it differs, so a customer never meets a setting. On the bench, `setup outputs 4` or `setup bell off` over the phone link does the same and restarts. A unit updated from an earlier release keeps its 2 + doorbell layout until told otherwise.
 
+**Card files** — wallpapers, festival art, tile icons and weather icons live on each panel's SD card, and the repository's `sdcard/` folder is the master copy. Lay it out exactly as the card is laid out:
+
+```
+sdcard/bg/day.rgb565
+sdcard/festival/diwali_night.rgb565
+sdcard/icons/bell.rgb565
+sdcard/weather_day/clear.rgb565
+```
+
+Commit a file there and `publish.yml` lists every file with its checksum in `firmware/assets.txt` and stamps the manifest. Each panel reads the manifest daily at 03:30 (and five minutes after a restart), sees the stamp change, and fetches only the files whose checksum differs from its card — downloaded in 64 KB pieces, verified before anything is written, swapped in by rename so a half-written file never exists. New wallpapers appear at once; new tile or bell art appears after a quiet restart when nobody is around. `sync` over the phone link does it immediately.
+
+Only `bg`, `festival`, `icons`, `ui`, `weather_day` and `weather_night` are accepted; the publisher refuses anything else, and panels never write outside those folders — `/config`, logs and firmware are out of reach. Deleting a file from the repository leaves the card copy in place. Firmware itself never goes through the card: it installs over the air from the phone page.
+
 **Festival dates** — put `config/festivals.txt` in the repository (`key,YYYY-MM-DD,YYYY-MM-DD`, one festival per line). `publish.yml` validates it and panels fetch it when its stamp changes. Navratri and other lunisolar dates come from the panchang, so the file is the single source of truth.
 
 <details>

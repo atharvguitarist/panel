@@ -11,6 +11,11 @@ config/festivals.txt. Also runnable locally from the repo root.
   config/festivals.txt      -> validated; its md5 prefix becomes the
                                manifest's "festivals" stamp, which is what
                                tells panels to fetch the new calendar
+  sdcard/<folder>/<file>    -> listed in firmware/assets.txt ("size md5
+                               /path"); its md5 prefix becomes the manifest's
+                               "assets" stamp. Panels fetch the files that
+                               differ from their card. Only the artwork
+                               folders below are allowed.
   firmware/manifest.json    -> rewritten only if something changed
 
 Refuses (exit 1, nothing written) on: a non-ESP32 file, two .bin uploads at
@@ -24,6 +29,12 @@ FW = os.path.join(ROOT, "firmware")
 LATEST = os.path.join(FW, "latest.bin")
 MANIFEST = os.path.join(FW, "manifest.json")
 FESTIVALS = os.path.join(ROOT, "config", "festivals.txt")
+SDCARD = os.path.join(ROOT, "sdcard")
+ASSETS = os.path.join(FW, "assets.txt")
+# Card folders panels accept from GitHub (keep in step with ASSET_ROOTS in the sketch).
+ASSET_ROOTS = ("bg", "festival", "icons", "ui", "weather_day", "weather_night")
+ASSET_NAME = re.compile(r"^[A-Za-z0-9_.\-/]+$")
+ASSET_MAX = 3_000_000
 CI = "GITHUB_ACTIONS" in os.environ
 
 def fail(msg):
@@ -89,6 +100,41 @@ def main():
         new["festivals"] = hashlib.md5(open(FESTIVALS, "rb").read()).hexdigest()[:8]
     else:
         new.pop("festivals", None)
+
+    # 4. Card files: list, checksum, stamp.
+    if os.path.isdir(SDCARD):
+        lines = []
+        for dirpath, _, files in os.walk(SDCARD):
+            for name in sorted(files):
+                full = os.path.join(dirpath, name)
+                rel = "/" + os.path.relpath(full, SDCARD).replace(os.sep, "/")
+                if name.startswith(".") or name.lower() in ("readme.md", "readme.txt"):
+                    continue
+                top = rel.split("/")[1]
+                if top not in ASSET_ROOTS:
+                    fail(f"sdcard{rel}: only {', '.join(ASSET_ROOTS)} may be sent to panels "
+                         "(never config, logs or firmware)")
+                if not ASSET_NAME.match(rel) or ".." in rel or len(rel) >= 64:
+                    fail(f"sdcard{rel}: use letters, digits, _ - . only, and keep the path under 64 characters")
+                data = open(full, "rb").read()
+                if not 0 < len(data) <= ASSET_MAX:
+                    fail(f"sdcard{rel}: {len(data):,} bytes -- files must be 1 byte to {ASSET_MAX:,} bytes")
+                lines.append(f"{len(data)} {hashlib.md5(data).hexdigest()} {rel}")
+        lines.sort(key=lambda l: l.split(" ", 2)[2])
+        if len(lines) > 400:
+            fail(f"{len(lines)} files under sdcard/ -- panels accept at most 400")
+        text = "\n".join(lines) + "\n" if lines else ""
+        if lines:
+            stamp = hashlib.md5(text.encode()).hexdigest()[:8]
+            if new.get("assets") != stamp or not os.path.isfile(ASSETS):
+                with open(ASSETS, "w", newline="\n") as f:
+                    f.write(text)
+                note(f"assets.txt -> {len(lines)} files, stamp {stamp}")
+            new["assets"] = stamp
+        else:
+            new.pop("assets", None)
+    else:
+        new.pop("assets", None)
 
     if src:
         if os.path.exists(LATEST):

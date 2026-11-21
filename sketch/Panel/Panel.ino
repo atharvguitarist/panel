@@ -179,7 +179,7 @@ const char* PHONE_UI_BASE_URL = "https://atharvguitarist.github.io/panel/";
 // straight out of the uploaded .bin -- change ONLY the number. FW_VERSION
 // points past the tag, so every existing use is unchanged, and because it is
 // used everywhere the linker can never strip the tag from the binary.
-const char  FW_VERSION_TAG[] = "PANELFW:5.9.3";
+const char  FW_VERSION_TAG[] = "PANELFW:5.9.8";
 const char* FW_VERSION = FW_VERSION_TAG + 8;
 const char* FW_MANIFEST_PATH = "firmware/manifest.json";
 const char* FW_BINARY_PATH   = "firmware/latest.bin";
@@ -295,7 +295,7 @@ const uint8_t MOTION_CONFIRM_LOW_SAMPLES  = 3;  // clears after 150ms stable LOW
 // ---- User-tunable settings: defaults below, real values loaded from NVS at boot ----
 // See loadUserSettings() / saveUserSetting*() near the Preferences section.
 unsigned long motionHoldTimeMs        = 5000;  // "Motion hold timer" — Settings > Motion (restored v1 default)
-uint8_t       motionConfirmHighSamples = 10;     // "PIR sensitivity" — Settings > Motion (Low=20 Med=10 High=5 *consecutive 50ms samples* -- restored v1 streak logic, see updateMotionSensor())
+uint8_t       motionConfirmHighSamples = 24;     // "PIR sensitivity" — Settings > Motion (Low=32 Med=24 High=16 *consecutive 50ms samples* -- restored v1 streak logic, see updateMotionSensor())
 unsigned long autoManualOffCooldownMs = 15000;  // "Manual mode cooldown" — Settings > Motion
 unsigned long uiDimAfterMs            = 5000;    // "Auto-dim delay" — Settings > Display
 bool          motionDetectionEnabled  = true;    // "Motion detection" — Settings > Motion
@@ -430,6 +430,21 @@ static const char *const OUTPUT_DEFAULT_NAMES[MAX_OUTPUTS] =
 struct TileGlow  { int16_t x, y, w, h, r; uint8_t opaOn; uint32_t c1, c2; bool shadow; uint8_t shOpa; };
 struct TileDecor { const char *icon; int16_t ix, iy; uint16_t iw, ih; TileGlow glow[2]; int16_t lx, lyFromBottom; uint32_t glyphColor; };
 struct TileRect  { int16_t x, y, w, h; };
+// What the weather worker hands to the UI thread (see weatherTask).
+struct WeatherResult {
+  bool ok, geoNew;
+  char lat[20], lon[20];
+  int httpCode, code;
+  float temp, precip;
+  long sunrise, sunset;
+  long rainAt;
+};
+// Outcome of a ranged HTTPS download (httpsRangedDownload).
+struct DlStats { int lastCode, attempts, reconnects; unsigned long ms; };
+// One file the repo wants on the card (from firmware/assets.txt).
+struct AssetEntry { char path[64]; uint32_t size; char md5[33]; bool ok; };
+// What a toast is about: a light switched on, off (cooldown), or back to automatic.
+enum ToastKind : uint8_t { TOAST_ON, TOAST_OFF, TOAST_AUTO };
 
 bool doorbellActive = false;
 unsigned long doorbellStartedAt = 0;
@@ -448,6 +463,9 @@ uint8_t motionHighStreak = 0;
 uint8_t motionLowStreak = 0;
 
 unsigned long lastMotionRawChangeAt = 0;
+unsigned long motionRawRiseAt      = 0;   // start of the HIGH pulse that confirmed the current event
+unsigned long motionRawFallAt      = 0;   // last time the pin went LOW
+uint16_t      motionShortPulses    = 0;   // HIGH pulses that ended before confirmation (HEALTH: "pir N")
 unsigned long lastMotionStableChangeAt = 0;
 
 unsigned long motionRawHighCount = 0;
@@ -724,7 +742,7 @@ char             firmwareUpdateMsg[128]    = "";  // human reason on failure
 enum { FWR_NONE = 0, FWR_UP_TO_DATE, FWR_AVAILABLE, FWR_DOWNLOADED, FWR_FAILED };
 // Declared here, above every function: the IDE emits fwFetchManifest()'s
 // auto-prototype at the top of the file, so its return type must exist there.
-struct FwManifest { char version[16]; size_t size; char md5[40]; char festivals[24]; bool ok; };
+struct FwManifest { char version[16]; size_t size; char md5[40]; char festivals[24]; char assets[24]; bool ok; };
 // Also up here for the same auto-prototype reason: enqueuePush() takes one.
 struct PushNotificationParams {
   char title[40];
@@ -769,6 +787,34 @@ static SemaphoreHandle_t tlsGate   = nullptr;   // outbound TLS: one at a time
 static char              pushFailPending[96] = ""; // worker -> loop(): log line
 volatile uint8_t festivalConfigSynced = 0; // 1 = SD file replaced from GitHub, 2 = already identical
 char festivalConfigVer[24] = "";            // stamp of the repo file last applied (NVS "festVer")
+// Festival file body fetched by the worker, validated and written by loop()
+// (the SD card is only ever touched from the UI thread).
+char    *festPendingBody = nullptr;
+size_t   festPendingLen  = 0;
+volatile bool festBodyReady = false;
+
+// ---- Card files from GitHub (the repo's sdcard/ folder) ----
+// The manifest's "assets" stamp names the current list (firmware/assets.txt:
+// "size md5 /path" per line). When it differs from the stamp this panel last
+// finished, the files that differ are fetched one at a time and swapped in
+// safely. Only the artwork folders below may be written -- never /config,
+// /log, /update or anything else.
+const char *ASSET_LIST_PATH = "firmware/assets.txt";
+const char *ASSET_DIR_URL   = "sdcard";             // repo folder mirrored to the card root
+const char *ASSET_INDEX     = "/sys/assets.idx";    // "md5 /path" of what this panel verified
+static const char *const ASSET_ROOTS[] = { "/bg/", "/festival/", "/icons/", "/ui/", "/weather_day/", "/weather_night/" };
+char     assetsVer[24]        = "";     // stamp last completed (NVS "assetVer")
+char     assetsRemoteStamp[24] = "";    // stamp the last manifest read reported
+volatile uint8_t assetPhase   = 0;      // see updateAssetSync()
+bool     assetSyncRequested   = false;
+bool     assetSyncReply       = false;  // the phone asked ("sync"): report back
+AssetEntry *assetList   = nullptr;
+uint16_t assetCount = 0, assetIdx = 0, assetChanged = 0, assetFailed = 0;
+uint8_t *assetBuf = nullptr;
+size_t   assetBufLen = 0;
+char    *assetIndexText = nullptr;      // old index, loaded at the start of a sync
+bool     assetNeedsRestart = false;     // icons/UI art changed: restart when nobody is around
+unsigned long assetRestartArmedAt = 0;
 char festivalConfigPendingVer[24] = "";     // stamp the worker just synced, stored by loop()
 const char *SD_UPDATE_FAILED_PATH = "/update/firmware.failed";
 unsigned long firmwareUploadPortalStartedAt = 0;
@@ -807,8 +853,30 @@ static lv_obj_t *updateUrlLabel = nullptr;
 static lv_obj_t *updateHintLabel = nullptr;
 
 static lv_obj_t *backgroundImage = nullptr;
-static lv_img_dsc_t bgDsc;
+static lv_img_dsc_t bgDsc, bgDsc2;          // two descriptors: the new wallpaper is built beside the old one
+static lv_img_dsc_t *bgDscInUse = &bgDsc;
 static uint8_t *bgBuffer = nullptr;
+bool uiLoopRunning    = false;              // loop() has started: work from here on must never block it
+bool bgContentChanged = false;              // a wallpaper file was replaced on the card: reload even if the path is the same
+
+// Wallpaper loads in the background: read from the card 12 KB per loop tick
+// into a second buffer while the current wallpaper stays on screen, then
+// swapped in whole in one frame. The theme's colours change at the same
+// moment, so text never sits on the wrong background.
+static struct {
+  bool     active, targetDark;
+  char     cand[3][72];
+  uint8_t  n, ci;
+  File     f;
+  uint8_t *buf;
+  size_t   off;
+} bgJob;
+
+// Weather runs on a worker on core 0; the UI thread only applies the result.
+static volatile bool weatherTaskRunning = false, weatherResultReady = false;
+static WeatherResult wxRes;
+static char wxLat[20] = "", wxLon[20] = "";
+static bool weatherFirstDone = false;
 
 // Small SD-card RGB565 UI icons.
 // Required files:
@@ -932,14 +1000,23 @@ void loadSavedSettings() {
   }
 
   // PIR sensitivity tiers: raw consecutive 50ms HIGH samples needed before
-  // motion is confirmed (Low=20 / Med=10 / High=5 -- see updateMotionSensor()).
+  // motion is confirmed (Low=32 / Med=24 / High=16 -- see updateMotionSensor()).
   // Deliberately a NEW key ("pirSens3", not "pirSens2") -- "pirSens2" stored
   // an occupancy-score threshold (60-90 range) on a since-removed scoring
   // algorithm; reinterpreting that as a raw sample count would have made
   // the sensor require minutes of unbroken motion to ever trigger. A fresh
   // key means any unit with an old "pirSens2" value safely ignores it and
   // gets the new default instead.
-  motionConfirmHighSamples = prefs.getUChar("pirSens3", 20);
+  motionConfirmHighSamples = prefs.getUChar("pirSens3", 24);
+  // 5.9.4 raised the tiers: a value stored by an older build moves to the
+  // same tier in the new table (Low/Medium/High keep their meaning).
+  switch (motionConfirmHighSamples) {
+    case 32: case 24: case 16: break;          // already a 5.9.4 value
+    case 30: motionConfirmHighSamples = 32; break;
+    case 20: motionConfirmHighSamples = 24; break;
+    case 10: motionConfirmHighSamples = 16; break;
+    default: motionConfirmHighSamples = 24; break;
+  }
 
   motionHoldTimeMs         = prefs.getULong("motHold", 10000);
   autoManualOffCooldownMs = prefs.getULong("manOff", 15000);
@@ -962,6 +1039,7 @@ void loadSavedSettings() {
   nvsPhoneUrl  = prefs.getString("phUrl", "");
   phoneSetupPending = prefs.getBool("phPend", false);
   prefs.getString("festVer", festivalConfigVer, sizeof(festivalConfigVer));
+  prefs.getString("assetVer", assetsVer, sizeof(assetsVer));
   nvsGeoLat    = prefs.getString("geoLat", "");
   nvsGeoLon    = prefs.getString("geoLon", "");
 
@@ -2232,11 +2310,8 @@ void applyClockPillPlacement() {
   lv_obj_clear_flag(clockPill, LV_OBJ_FLAG_HIDDEN);
 
   // Five or more tiles fill the bottom of the screen, so the pill goes up.
-  if (mode == CLOCK_PILL_TOP_RIGHT || outputCount >= 5) {
-    lv_obj_set_pos(clockPill, 657, 24);
-  } else {
-    lv_obj_set_pos(clockPill, 657, 417);
-  }
+  bool atTop = (mode == CLOCK_PILL_TOP_RIGHT || outputCount >= 5);
+  lv_obj_set_pos(clockPill, 657, atTop ? 24 : 417);
 }
 
 bool isNightNow() {
@@ -2545,13 +2620,15 @@ void updateBootSequence() {
 // the world. Called once per boot, right before the first weather fetch.
 // Result is cached in NVS so weather has an immediate value on the next
 // boot even before this fetch completes again.
-bool fetchIpGeolocation() {
+// Worker-side: fills lat/lon text, touches no NVS and no UI.
+bool fetchIpGeolocation(char *latOut, char *lonOut, size_t n) {
   if (WiFi.status() != WL_CONNECTED) {
     return false;
   }
 
   HTTPClient http;
-  http.setTimeout(4000);
+  http.setConnectTimeout(5000);
+  http.setTimeout(5000);
   http.begin("http://ip-api.com/json/?fields=lat,lon,status");
 
   int httpCode = http.GET();
@@ -2578,7 +2655,8 @@ bool fetchIpGeolocation() {
     return false;
   }
 
-  saveGeoLocation(String(lat, 6), String(lon, 6));
+  snprintf(latOut, n, "%.6f", lat);
+  snprintf(lonOut, n, "%.6f", lon);
   return true;
 }
 
@@ -2846,70 +2924,48 @@ static void updateWeatherTicker() {
   }
 }
 
-void updateWeather() {
-  static unsigned long lastWeatherAttempt = 0;
-  static bool firstWeatherUpdate = true;
+// Core-0 worker: location (first time only), then Open-Meteo, parsed here.
+// DNS, connect and read can each take seconds on weak Wi-Fi; none of it
+// touches the UI thread any more.
+static void weatherTask(void *param) {
+  (void)param;
+  WeatherResult r;
+  memset(&r, 0, sizeof(r));
 
-  if (WiFi.status() != WL_CONNECTED) {
-    // Keep cached/placeholder weather visible. Do not repeatedly blank it.
-    return;
-  }
-
-  // Weather is intentionally gated behind NTP. If time is not valid, internet
-  // is probably not usable yet, so avoid unnecessary HTTP polling.
-  if (!isTimeReadyFast()) {
-    return;
-  }
-
-  unsigned long retryInterval = firstWeatherUpdate ? WEATHER_FIRST_RETRY_MS : WEATHER_UPDATE_MS;
-
-  if (!forceWeatherFetchAfterNtp && lastWeatherAttempt != 0 && millis() - lastWeatherAttempt < retryInterval) {
-    return;
-  }
-
-  forceWeatherFetchAfterNtp = false;
-
-  // Location is auto-detected. If we don't have one cached yet, fetch it
-  // now (one-time per boot, cheap) before asking for weather.
-  if (nvsGeoLat.length() == 0 || nvsGeoLon.length() == 0) {
-    if (!fetchIpGeolocation()) {
-      return; // no location yet -- try again on next scheduled attempt
+  if (!wxLat[0] || !wxLon[0]) {
+    if (fetchIpGeolocation(r.lat, r.lon, sizeof(r.lat))) {
+      r.geoNew = true;
+      strncpy(wxLat, r.lat, sizeof(wxLat) - 1);
+      strncpy(wxLon, r.lon, sizeof(wxLon) - 1);
+    } else {
+      wxRes = r; weatherResultReady = true; weatherTaskRunning = false;
+      vTaskDelete(nullptr); return;
     }
   }
 
-  lastWeatherAttempt = millis();
-
-  HTTPClient http;
-
   // Open-Meteo: free, no API key, global coverage, WMO weather codes.
-  // current_weather gives us temperature + weathercode + windspeed in one call.
-  // daily sunrise/sunset added so theme scheduling stays accurate.
-  String url = "http://api.open-meteo.com/v1/forecast?latitude=";
-  url += nvsGeoLat;
-  url += "&longitude=";
-  url += nvsGeoLon;
   // current=precipitation adds ground truth in millimetres. The WMO weathercode
   // is a model classification and routinely reports 0-3 (clear/cloudy) through
-  // light drizzle; actual measured precipitation does not. One extra field.
-  url += "&current_weather=true&current=precipitation&daily=sunrise,sunset&hourly=precipitation_probability&forecast_days=1&timeformat=unixtime&timezone=auto";
-  if (strcmp(WEATHER_UNITS, "metric") == 0) {
-    url += "&temperature_unit=celsius";
-  } else {
-    url += "&temperature_unit=fahrenheit";
-  }
+  // light drizzle; actual measured precipitation does not.
+  char url[420];
+  snprintf(url, sizeof(url),
+           "http://api.open-meteo.com/v1/forecast?latitude=%s&longitude=%s"
+           "&current_weather=true&current=precipitation&daily=sunrise,sunset"
+           "&hourly=precipitation_probability&forecast_days=1&timeformat=unixtime&timezone=auto%s",
+           wxLat, wxLon,
+           strcmp(WEATHER_UNITS, "metric") == 0 ? "&temperature_unit=celsius" : "&temperature_unit=fahrenheit");
 
-  http.setTimeout(4000);
+  HTTPClient http;
+  http.setConnectTimeout(6000);
+  http.setTimeout(6000);
   http.begin(url);
+  r.httpCode = http.GET();
 
-  int httpCode = http.GET();
-  lastWeatherHttpCode = httpCode;
-
-  if (httpCode == 200) {
+  if (r.httpCode == 200) {
     String payload = http.getString();
 
     // The hourly block adds ~24 timestamps + 24 probabilities to the payload,
-    // so parse with a filter (only the keys we read survive) into a transient
-    // heap document instead of growing a stack-resident StaticJsonDocument.
+    // so parse with a filter (only the keys we read survive) into PSRAM.
     StaticJsonDocument<192> filter;
     filter["current_weather"] = true;
     filter["current"] = true;
@@ -2917,89 +2973,112 @@ void updateWeather() {
     filter["hourly"]["time"] = true;
     filter["hourly"]["precipitation_probability"] = true;
 
-    SpiRamJsonDocument doc(6144);   // PSRAM: keeps the internal heap whole for TLS
-    DeserializationError error =
-        deserializeJson(doc, payload, DeserializationOption::Filter(filter));
+    SpiRamJsonDocument doc(6144);
+    if (!deserializeJson(doc, payload, DeserializationOption::Filter(filter))) {
+      float temp = doc["current_weather"]["temperature"] | 0.0f;
+      int   code = doc["current_weather"]["weathercode"] | 0;
+      float wind = doc["current_weather"]["windspeed"]   | 0.0f;
 
-    if (!error) {
-      float temp    = doc["current_weather"]["temperature"] | 0.0f;
-      int   code    = doc["current_weather"]["weathercode"] | 0;
-      float wind    = doc["current_weather"]["windspeed"]   | 0.0f;
+      // A windy day on a clear code shows the wind icon.
+      if ((code == 0 || code == 1 || code == 2) && wind >= 40.0f) code = 999;
 
-      // Use high-windspeed as a secondary icon trigger (WMO 75/77/95+ already
-      // cover severe wind, but for a milder windy day the code is just 0/1/2).
-      // Treat sustained wind >= 40 km/h as "wind" icon even on a clear code.
-      if ((code == 0 || code == 1 || code == 2) && wind >= 40.0f) {
-        code = 999; // internal sentinel: use wind icon
-      }
-
-      // Measured rain overrides an optimistic weathercode. Anything at or above
-      // 0.1 mm in the current hour is wet enough to matter to someone about to
-      // open the door, so promote the code into the drizzle/rain band.
+      // Measured rain overrides an optimistic weathercode.
       float precipNow = doc["current"]["precipitation"] | 0.0f;
-      currentPrecipMm = precipNow;
       if (precipNow >= 0.1f && !(code >= 51 && code <= 67) &&
           !(code >= 80 && code <= 82) && !(code >= 95 && code <= 99)) {
         code = (precipNow >= 2.5f) ? 63 : 61;
       }
 
-      // Open-Meteo daily arrays — index 0 = today.
-      sunriseEpoch = doc["daily"]["sunrise"][0] | 0L;
-      sunsetEpoch  = doc["daily"]["sunset"][0]  | 0L;
-
-      weatherHasSunTimes = (sunriseEpoch > 0 && sunsetEpoch > 0);
+      r.sunrise = doc["daily"]["sunrise"][0] | 0L;
+      r.sunset  = doc["daily"]["sunset"][0]  | 0L;
 
       // Rain outlook: first hourly slot in the next 6h at >= 50% probability.
-      // Tighter window on purpose: "rain at 2 PM" shown at 2 AM is trivia,
-      // not an alert. Recomputed from scratch on every fetch (incl. to "none").
-      rainExpectedEpoch = 0;
-      {
-        JsonArrayConst ht = doc["hourly"]["time"].as<JsonArrayConst>();
-        JsonArrayConst hp = doc["hourly"]["precipitation_probability"].as<JsonArrayConst>();
-        if (!ht.isNull() && !hp.isNull()) {
-          time_t nowT = time(nullptr);
-          size_t cnt = ht.size() < hp.size() ? ht.size() : hp.size();
-          for (size_t i = 0; i < cnt; i++) {
-            long slot = ht[i] | 0L;
-            int  prob = hp[i] | 0;
-            if (slot <= (long)nowT) continue;
-            if (slot > (long)nowT + 6L * 3600L) break;
-            if (prob >= 50) {
-              rainExpectedEpoch = (time_t)slot;
-              break;
-            }
-          }
+      JsonArrayConst ht = doc["hourly"]["time"].as<JsonArrayConst>();
+      JsonArrayConst hp = doc["hourly"]["precipitation_probability"].as<JsonArrayConst>();
+      if (!ht.isNull() && !hp.isNull()) {
+        time_t nowT = time(nullptr);
+        size_t cnt = ht.size() < hp.size() ? ht.size() : hp.size();
+        for (size_t i = 0; i < cnt; i++) {
+          long slot = ht[i] | 0L;
+          int  prob = hp[i] | 0;
+          if (slot <= (long)nowT) continue;
+          if (slot > (long)nowT + 6L * 3600L) break;
+          if (prob >= 50) { r.rainAt = slot; break; }
         }
       }
 
-      if (weatherHasSunTimes) {
-        scheduleNextThemeEvent();
-        if (!initialThemeSet && isTimeReadyFast()) {
-          applyTheme(true);
-          initialThemeSet = true;
-        }
-      }
+      r.temp = temp; r.code = code; r.precip = precipNow;
+      r.ok = true;
+    }
+  }
+  http.end();
 
-      // Build a short human-readable condition string from the WMO code.
-      const char* condLabel = wmoCodeLabel(code);
-      strncpy(weatherCondition, condLabel, sizeof(weatherCondition));
-      weatherCondition[sizeof(weatherCondition) - 1] = '\0';
-      wmoCode = code;
+  wxRes = r;
+  weatherResultReady = true;
+  weatherTaskRunning = false;
+  vTaskDelete(nullptr);
+}
 
-      currentWeatherTemp = (int)round(temp);
-      char buffer[20];
-      snprintf(buffer, sizeof(buffer), "%d °C", currentWeatherTemp);
-      weatherTickerReset();                 // never fight the ticker mid-fade
-      lv_label_set_text(weatherLabel, buffer);
-      updateWeatherIconDisplay(true);
+// UI thread: decide whether a fetch is due and start the worker. Never waits.
+void updateWeather() {
+  static unsigned long lastWeatherAttempt = 0;
 
-      lastWeatherUpdatedAt = millis();
-      firstWeatherUpdate   = false;
-      saveCachedWeather((int)round(temp), code, condLabel);
+  if (WiFi.status() != WL_CONNECTED) return;   // keep cached/placeholder weather visible
+  // Gated behind NTP: no valid time usually means no usable internet yet.
+  if (!isTimeReadyFast()) return;
+  if (weatherTaskRunning) return;
+
+  unsigned long retryInterval = weatherFirstDone ? WEATHER_UPDATE_MS : WEATHER_FIRST_RETRY_MS;
+  if (!forceWeatherFetchAfterNtp && lastWeatherAttempt != 0 && millis() - lastWeatherAttempt < retryInterval) return;
+
+  forceWeatherFetchAfterNtp = false;
+  lastWeatherAttempt = millis();      // set before the attempt: a failure waits for the next slot, never spins
+  strncpy(wxLat, nvsGeoLat.c_str(), sizeof(wxLat) - 1);
+  strncpy(wxLon, nvsGeoLon.c_str(), sizeof(wxLon) - 1);
+  weatherTaskRunning = true;
+  if (xTaskCreatePinnedToCore(weatherTask, "weather", 8192, nullptr, 1, nullptr, 0) != pdPASS)
+    weatherTaskRunning = false;
+}
+
+// UI thread: apply what the worker found.
+static void applyWeatherResult() {
+  if (!weatherResultReady) return;
+  weatherResultReady = false;
+  WeatherResult r = wxRes;
+
+  if (r.geoNew) saveGeoLocation(String(r.lat), String(r.lon));
+  lastWeatherHttpCode = r.httpCode;
+  if (!r.ok) return;
+
+  currentPrecipMm   = r.precip;
+  sunriseEpoch      = r.sunrise;
+  sunsetEpoch       = r.sunset;
+  weatherHasSunTimes = (sunriseEpoch > 0 && sunsetEpoch > 0);
+  rainExpectedEpoch = (time_t)r.rainAt;
+
+  if (weatherHasSunTimes) {
+    scheduleNextThemeEvent();
+    if (!initialThemeSet && isTimeReadyFast()) {
+      applyTheme(true);
+      initialThemeSet = true;
     }
   }
 
-  http.end();
+  const char *condLabel = wmoCodeLabel(r.code);
+  strncpy(weatherCondition, condLabel, sizeof(weatherCondition));
+  weatherCondition[sizeof(weatherCondition) - 1] = '\0';
+  wmoCode = r.code;
+
+  currentWeatherTemp = (int)round(r.temp);
+  char buffer[20];
+  snprintf(buffer, sizeof(buffer), "%d °C", currentWeatherTemp);
+  weatherTickerReset();                 // never fight the ticker mid-fade
+  lv_label_set_text(weatherLabel, buffer);
+  updateWeatherIconDisplay(true);
+
+  lastWeatherUpdatedAt = millis();
+  weatherFirstDone     = true;
+  saveCachedWeather(currentWeatherTemp, r.code, condLabel);
 }
 
 void loadCachedWeather() {
@@ -3360,6 +3439,7 @@ bool loadRGB565Background(const char *fsPath) {
     return false;
   }
 
+  bgDscInUse = &bgDsc;
   bgDsc.header.always_zero = 0;
   bgDsc.header.w = 800;
   bgDsc.header.h = 480;
@@ -3393,15 +3473,118 @@ bool isSafeToSwitchThemeNow() {
   return userIdle && motionIdle && !motionState;
 }
 
+// Finish a background load: show the new wallpaper (if any) and the theme's
+// colours in the same frame, then let the old one go.
+static void bgFinish(uint8_t *newBuf, const char *path) {
+  bgJob.active = false;
+  darkThemeActive = bgJob.targetDark;
+  if (newBuf) {
+    lv_img_dsc_t *d = (bgDscInUse == &bgDsc) ? &bgDsc2 : &bgDsc;
+    d->header.always_zero = 0;
+    d->header.w = 800;
+    d->header.h = 480;
+    d->header.cf = LV_IMG_CF_TRUE_COLOR;
+    d->data_size = 800 * 480 * 2;
+    d->data = newBuf;
+    lv_obj_t *img = lv_img_create(mainScreen);
+    lv_img_set_src(img, d);
+    lv_obj_set_pos(img, 0, 0);
+    lv_obj_set_size(img, 800, 480);
+    lv_obj_clear_flag(img, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_move_background(img);
+    lv_obj_t *oldImg = backgroundImage;
+    uint8_t  *oldBuf = bgBuffer;
+    backgroundImage = img;
+    bgBuffer = newBuf;
+    bgDscInUse = d;
+    bgJob.buf = nullptr;
+    if (oldImg) lv_obj_del(oldImg);
+    if (oldBuf) free(oldBuf);
+    strncpy(currentBackgroundPath, path, sizeof(currentBackgroundPath) - 1);
+    currentBackgroundPath[sizeof(currentBackgroundPath) - 1] = '\0';
+  }
+  applyThemeColors();
+  updateWeatherIconDisplay(true);
+}
+
+// loop(): one slice of the background load.
+static void bgLoadTick() {
+  if (!bgJob.active) return;
+  const size_t SZ = 800 * 480 * 2;
+  if (!bgJob.f) {
+    while (bgJob.ci < bgJob.n) {
+      const char *p = bgJob.cand[bgJob.ci];
+      if (p[0] && sdMounted && SD.exists(p)) {
+        // Already showing exactly this file: nothing to read.
+        if (!bgContentChanged && backgroundImage && strcmp(p, currentBackgroundPath) == 0) { bgFinish(nullptr, p); return; }
+        File f = SD.open(p, FILE_READ);
+        bool noMem = false;
+        if (f && f.size() == SZ) {
+          if (!bgJob.buf) bgJob.buf = (uint8_t *)ps_malloc(SZ);
+          if (bgJob.buf) { bgJob.f = f; bgJob.off = 0; return; }
+          noMem = true;
+        }
+        if (f) f.close();
+        if (noMem) break;                                  // out of PSRAM: give up on artwork
+      }
+      bgJob.ci++;
+    }
+    // Nothing loadable: plain background in the theme's colour.
+    if (bgJob.buf) { free(bgJob.buf); bgJob.buf = nullptr; }
+    bgJob.active = false;
+    darkThemeActive = bgJob.targetDark;
+    clearBackgroundToPlain();
+    applyThemeColors();
+    updateWeatherIconDisplay(true);
+    return;
+  }
+  size_t n = SZ - bgJob.off;
+  if (n > 12288) n = 12288;
+  size_t got = bgJob.f.read(bgJob.buf + bgJob.off, n);
+  if (got != n) { bgJob.f.close(); bgJob.f = File(); bgJob.ci++; return; }   // short read: next candidate
+  bgJob.off += got;
+  if (bgJob.off < SZ) return;
+  bgJob.f.close();
+  bgJob.f = File();
+  bgContentChanged = false;
+  bgFinish(bgJob.buf, bgJob.cand[bgJob.ci]);
+}
+
+static void bgStartJob(const char *a, const char *b, const char *c, bool dark) {
+  if (bgJob.f) { bgJob.f.close(); bgJob.f = File(); }
+  strncpy(bgJob.cand[0], a ? a : "", sizeof(bgJob.cand[0]) - 1); bgJob.cand[0][sizeof(bgJob.cand[0]) - 1] = '\0';
+  strncpy(bgJob.cand[1], b ? b : "", sizeof(bgJob.cand[1]) - 1); bgJob.cand[1][sizeof(bgJob.cand[1]) - 1] = '\0';
+  strncpy(bgJob.cand[2], c ? c : "", sizeof(bgJob.cand[2]) - 1); bgJob.cand[2][sizeof(bgJob.cand[2]) - 1] = '\0';
+  bgJob.n = 3; bgJob.ci = 0; bgJob.off = 0;
+  bgJob.targetDark = dark;
+  bgJob.active = true;                                       // buffer kept if one is already allocated
+}
+
 void applyTheme(bool forceReload) {
   updateActiveThemeForToday(forceReload);
 
   bool shouldBeDark = isNightNow();
 
-  darkThemeActive = shouldBeDark;
-
   const char *preferred = shouldBeDark ? activeDarkPath : activeLightPath;
   const char *fallback  = shouldBeDark ? activeLightPath : activeDarkPath;
+
+  // Once loop() runs, the wallpaper loads in the background (bgLoadTick).
+  // Before that -- the first screen being built in setup() -- the old
+  // synchronous path below is fine: nothing is on screen to stall yet.
+  if (uiLoopRunning) {
+    bool showingPreferred = backgroundImage != nullptr && strcmp(currentBackgroundPath, preferred) == 0;
+    bool showingFallback  = backgroundImage != nullptr && strcmp(currentBackgroundPath, fallback) == 0;
+    if (!bgContentChanged && (showingPreferred || (!forceReload && showingFallback))) {
+      darkThemeActive = shouldBeDark;
+      applyThemeColors();
+      return;
+    }
+    if (bgJob.active && bgJob.targetDark == shouldBeDark && strcmp(bgJob.cand[0], preferred) == 0) return;   // already on its way
+    bgStartJob(preferred, fallback, shouldBeDark ? "/bg/night.rgb565" : "/bg/day.rgb565", shouldBeDark);
+    return;
+  }
+
+  darkThemeActive = shouldBeDark;
 
   bool currentMatches = strcmp(currentBackgroundPath, preferred) == 0 ||
                         strcmp(currentBackgroundPath, fallback) == 0;
@@ -3735,67 +3918,142 @@ static const lv_font_t *fitNameFont(const char *name, int16_t avail, int16_t th)
   return sz.x <= avail ? FONT_26 : FONT_18;
 }
 
-// ---- Bubble: a one-line note that drops in from the top ----
-// Says what a tap just did and when it ends ("Ceiling Glow off. Auto again
-// in 15 s"), holds three seconds, slides back up. ASCII only: the fonts in
-// flash carry no middle dot or dash. Lives on the top layer;
-// its band (y 14..58) is clear of every tile, and it lets touches through.
-// Cream, hairline border, soft shadow, the small Figtree -- the same voice
-// as the phone page. One object, made once, reused.
-static lv_obj_t  *toastBox = nullptr, *toastLabel = nullptr;
+// ---- Toast: a one-line note in the top-right corner ----
+// Always the top-right corner, above everything (it may cover the clock
+// pill for its three seconds). Dressed by the active theme:
+//   day   -- frosted cream glass, ink name, the theme's accent (deepened
+//            for contrast) on the border, the dot and the status text;
+//   night -- dark glass, cream name, the theme's accent as is.
+// So it is gold on an ordinary day, marigold at Diwali, magenta at Holi,
+// crimson at Christmas, and so on -- see themeAccent().
+//   [dot]  Ceiling Glow   On until sunrise
+// Fades and drifts in (260 ms), holds 3 s, fades up and out. Main screen
+// only; lets touches through. One object, made once, reused.
+static lv_obj_t  *toastBox = nullptr, *toastDot = nullptr, *toastName = nullptr, *toastText = nullptr;
 static lv_timer_t *toastTimer = nullptr;
-static const int16_t TOAST_W = 340, TOAST_X = 498 - TOAST_W / 2, TOAST_Y = 14, TOAST_Y_HIDDEN = -64;
 
-static void toastYAnimCb(void *obj, int32_t v) { lv_obj_set_y((lv_obj_t *)obj, v); }
+// Each theme's accent colour. Unknown keys and ordinary days: the house gold.
+struct ThemeAccentEntry { const char *key; uint32_t rgb; };
+static const ThemeAccentEntry THEME_ACCENTS[] = {
+  { "diwali",           0xF2A93B },   // marigold
+  { "holi",             0xE0457B },   // gulal pink
+  { "navratri",         0xE0533D },   // vermilion
+  { "christmas",        0xD64545 },   // holly red
+  { "new_year",         0xE6C77A },   // champagne
+  { "ganesh_chaturthi", 0xF28C28 },   // saffron
+  { "ganesh",           0xF28C28 },
+  { "janmashtami",      0x2F9BB5 },   // peacock blue
+  { "rakhi",            0xE07A9B },   // rose
+  { "halloween",        0xF07D2E },   // pumpkin
+  { "valentines",       0xE2557A },
+  { "valentine",        0xE2557A },
+  { "mothers_day",      0xE58FA6 },   // blush
+  { "fathers_day",      0x6B9AC4 },   // steel blue
+  { "winter",           0x8FB3CF },   // frost
+};
+static uint32_t themeAccent() {
+  for (size_t i = 0; i < sizeof(THEME_ACCENTS) / sizeof(THEME_ACCENTS[0]); i++)
+    if (strcmp(activeThemeKey, THEME_ACCENTS[i].key) == 0) return THEME_ACCENTS[i].rgb;
+  return 0xC9A85C;                                    // house gold
+}
+// The same hue, darker: for text and borders on cream glass by day.
+static uint32_t deepen(uint32_t c) {
+  uint32_t r = ((c >> 16) & 0xFF) * 58 / 100, g = ((c >> 8) & 0xFF) * 58 / 100, b = (c & 0xFF) * 58 / 100;
+  return (r << 16) | (g << 8) | b;
+}
+
+static void toastAnimCb(void *obj, int32_t v) {
+  // v: 0 = hidden (transparent, 10 px up) .. 256 = shown
+  lv_obj_set_style_opa((lv_obj_t *)obj, (lv_opa_t)(v > 255 ? 255 : v), 0);
+  lv_obj_set_style_translate_y((lv_obj_t *)obj, (lv_coord_t)(-10 + (10 * v) / 256), 0);
+}
 static void toastHiddenCb(lv_anim_t *a) { (void)a; if (toastBox) lv_obj_add_flag(toastBox, LV_OBJ_FLAG_HIDDEN); }
-static void toastSlide(int16_t to, bool thenHide) {
-  lv_anim_del(toastBox, toastYAnimCb);
+static void toastAnimate(bool in) {
+  lv_anim_del(toastBox, toastAnimCb);
   lv_anim_t a;
   lv_anim_init(&a);
   lv_anim_set_var(&a, toastBox);
-  lv_anim_set_exec_cb(&a, toastYAnimCb);
-  lv_anim_set_values(&a, lv_obj_get_y(toastBox), to);
-  lv_anim_set_time(&a, thenHide ? 220 : 280);
-  lv_anim_set_path_cb(&a, thenHide ? lv_anim_path_ease_in : lv_anim_path_ease_out);
-  if (thenHide) lv_anim_set_ready_cb(&a, toastHiddenCb);
+  lv_anim_set_exec_cb(&a, toastAnimCb);
+  lv_anim_set_values(&a, in ? 0 : 256, in ? 256 : 0);
+  lv_anim_set_time(&a, in ? 260 : 200);
+  lv_anim_set_path_cb(&a, in ? lv_anim_path_ease_out : lv_anim_path_ease_in);
+  if (!in) lv_anim_set_ready_cb(&a, toastHiddenCb);
   lv_anim_start(&a);
 }
-static void toastTimerCb(lv_timer_t *t) { (void)t; toastTimer = nullptr; toastSlide(TOAST_Y_HIDDEN, true); }
+static void toastTimerCb(lv_timer_t *t) { (void)t; toastTimer = nullptr; toastAnimate(false); }
 
-void showToast(const char *text) {
+static lv_obj_t *toastLabel(lv_obj_t *parent, uint32_t color) {
+  lv_obj_t *l = lv_label_create(parent);
+  lv_obj_set_style_text_font(l, FONT_18, 0);
+  lv_obj_set_style_text_color(l, lv_color_hex(color), 0);
+  return l;
+}
+
+void showToast(const char *name, const char *text, ToastKind kind) {
+  if (lv_scr_act() != mainScreen) return;   // a note about the tiles belongs with the tiles
   if (!toastBox) {
     toastBox = lv_obj_create(lv_layer_top());
     lv_obj_remove_style_all(toastBox);
-    lv_obj_set_size(toastBox, TOAST_W, LV_SIZE_CONTENT);
-    lv_obj_set_pos(toastBox, TOAST_X, TOAST_Y_HIDDEN);
-    lv_obj_set_style_bg_color(toastBox, lv_color_hex(0xFFFDF6), 0);
-    lv_obj_set_style_bg_opa(toastBox, 255, 0);
-    lv_obj_set_style_border_color(toastBox, lv_color_hex(0xE3D8B8), 0);
-    lv_obj_set_style_border_width(toastBox, 1, 0);
-    lv_obj_set_style_radius(toastBox, 22, 0);
-    lv_obj_set_style_pad_hor(toastBox, 18, 0);
-    lv_obj_set_style_pad_ver(toastBox, 11, 0);
-    lv_obj_set_style_shadow_width(toastBox, 22, 0);
-    lv_obj_set_style_shadow_ofs_y(toastBox, 6, 0);
-    lv_obj_set_style_shadow_color(toastBox, lv_color_hex(0x3D3830), 0);
-    lv_obj_set_style_shadow_opa(toastBox, 42, 0);
+    lv_obj_set_size(toastBox, LV_SIZE_CONTENT, 47);
+    lv_obj_set_style_border_width(toastBox, 2, 0);
+    lv_obj_set_style_shadow_width(toastBox, 18, 0);
+    lv_obj_set_style_shadow_ofs_y(toastBox, 5, 0);
+    lv_obj_set_style_shadow_color(toastBox, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_radius(toastBox, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_pad_left(toastBox, 18, 0);
+    lv_obj_set_style_pad_right(toastBox, 22, 0);
+    lv_obj_set_style_pad_column(toastBox, 10, 0);
+    lv_obj_set_flex_flow(toastBox, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(toastBox, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_clear_flag(toastBox, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_clear_flag(toastBox, LV_OBJ_FLAG_SCROLLABLE);
-    toastLabel = lv_label_create(toastBox);
-    lv_label_set_long_mode(toastLabel, LV_LABEL_LONG_DOT);
-    lv_obj_set_width(toastLabel, TOAST_W - 36);
-    lv_obj_set_style_text_align(toastLabel, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_font(toastLabel, FONT_18, 0);
-    lv_obj_set_style_text_color(toastLabel, lv_color_hex(0x3D3830), 0);
+
+    toastDot = lv_obj_create(toastBox);
+    lv_obj_remove_style_all(toastDot);
+    lv_obj_set_size(toastDot, 9, 9);
+    lv_obj_set_style_radius(toastDot, LV_RADIUS_CIRCLE, 0);
+
+    toastName = toastLabel(toastBox, 0x1B0505);
+    toastText = toastLabel(toastBox, 0x7C6839);
+    lv_obj_add_flag(toastBox, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_align(toastBox, LV_ALIGN_TOP_RIGHT, -14, 24);
   }
-  lv_label_set_text(toastLabel, text);
+
+  // Theme dress, read fresh each time so a theme change mid-day is honoured.
+  const bool night  = darkThemeActive;
+  const uint32_t ac = themeAccent();
+  const uint32_t acText = night ? ac : deepen(ac);       // readable on cream glass
+  lv_obj_set_style_bg_color(toastBox, lv_color_hex(night ? 0x000000 : 0xFFFBF2), 0);
+  lv_obj_set_style_bg_opa(toastBox, night ? 232 : 250, 0);   // opaque enough that the clock pill does not ghost through
+  lv_obj_set_style_border_color(toastBox, lv_color_hex(night ? ac : acText), 0);
+  lv_obj_set_style_border_opa(toastBox, night ? 255 : 200, 0);
+  lv_obj_set_style_shadow_opa(toastBox, night ? 0 : 38, 0);
+  lv_obj_set_style_text_color(toastName, lv_color_hex(night ? 0xFEF2BE : 0x1B0505), 0);
+  lv_obj_set_style_text_color(toastText, lv_color_hex(acText), 0);
+
+  // The state dot: lit for on, an empty ring for off, plain for "automatic again".
+  uint32_t dotC = (kind == TOAST_AUTO) ? (night ? 0xFEF2BE : 0x1B0505) : acText;
+  lv_obj_set_style_bg_color(toastDot, lv_color_hex(dotC), 0);
+  lv_obj_set_style_bg_opa(toastDot, kind == TOAST_OFF ? 0 : 255, 0);
+  lv_obj_set_style_border_color(toastDot, lv_color_hex(dotC), 0);
+  lv_obj_set_style_border_width(toastDot, kind == TOAST_OFF ? 2 : 0, 0);
+  lv_obj_set_style_shadow_color(toastDot, lv_color_hex(ac), 0);
+  lv_obj_set_style_shadow_width(toastDot, kind == TOAST_ON ? 10 : 0, 0);
+  lv_obj_set_style_shadow_opa(toastDot, kind == TOAST_ON ? 170 : 0, 0);
+
+  lv_label_set_text(toastName, name);
+  lv_label_set_text(toastText, text);
+
   if (lv_obj_has_flag(toastBox, LV_OBJ_FLAG_HIDDEN)) {
-    lv_obj_set_y(toastBox, TOAST_Y_HIDDEN);
+    toastAnimCb(toastBox, 0);
     lv_obj_clear_flag(toastBox, LV_OBJ_FLAG_HIDDEN);
-    toastSlide(TOAST_Y, false);
+    toastAnimate(true);
+  } else {
+    lv_anim_del(toastBox, toastAnimCb);     // already showing (or leaving): settle it shown
+    toastAnimCb(toastBox, 256);
   }
   if (toastTimer) lv_timer_reset(toastTimer);
-  else { toastTimer = lv_timer_create(toastTimerCb, 3200, nullptr); lv_timer_set_repeat_count(toastTimer, 1); }
+  else { toastTimer = lv_timer_create(toastTimerCb, 3000, nullptr); lv_timer_set_repeat_count(toastTimer, 1); }
 }
 
 // How the manual-off cooldown reads, for the bubble: "15 s" or "2 min".
@@ -4183,9 +4441,10 @@ void doorbellCb(lv_event_t *e) {
 // whichever tile (ceiling or panel) is currently assigned as the motion-
 // controlled light. See motionTarget / applyAutoOutput / updateAutoLightUI.
 void handleAutoLightTap() {
-  char note[72];
+  char note[40];
+  ToastKind kind = TOAST_ON;
   const char *nm = outputs[motionTarget].name;
-  const char *till = (weatherHasSunTimes && sunriseEpoch > 0) ? "until sunrise" : "until morning";
+  const char *till = (weatherHasSunTimes && sunriseEpoch > 0) ? "On until sunrise" : "On until morning";
   if (autoMode == AUTO_MODE_AUTO) {
     // Manual ON: keep the light ON until the user turns it off or the
     // safety timer expires.
@@ -4194,7 +4453,7 @@ void handleAutoLightTap() {
     autoManualOffStartedAt = 0;
     applyAutoOutput(true);
     updateStatus("Status: Auto light manual ON");
-    snprintf(note, sizeof(note), "%s on %s", nm, till);
+    snprintf(note, sizeof(note), "%s", till);
   } else if (autoMode == AUTO_MODE_MANUAL_ON) {
     autoMode = AUTO_MODE_MANUAL_OFF;
     autoManualStartedAt = 0;
@@ -4209,7 +4468,8 @@ void handleAutoLightTap() {
     updateStatus("Status: Auto light manual OFF");
     char cd[16];
     cooldownText(cd, sizeof(cd));
-    snprintf(note, sizeof(note), "%s off. Auto again in %s", nm, cd);
+    snprintf(note, sizeof(note), "Off, automatic in %s", cd);
+    kind = TOAST_OFF;
   } else {
     // Manual OFF -> Manual ON
     autoMode = AUTO_MODE_MANUAL_ON;
@@ -4218,12 +4478,12 @@ void handleAutoLightTap() {
     autoManualOffStartedAt = 0;
     applyAutoOutput(true);
     updateStatus("Status: Auto light manual ON");
-    snprintf(note, sizeof(note), "%s on %s", nm, till);
+    snprintf(note, sizeof(note), "%s", till);
   }
 
   updateAutoLightUI();
   saveRestoreState();
-  showToast(note);
+  showToast(nm, note, kind);
 }
 
 // One callback for every output tile; the tile tells us which output.
@@ -4961,6 +5221,7 @@ enum RemoteCommand : uint8_t {
   RCMD_VERSION,   // silent: the phone page asking for version + light state
   RCMD_LIGHT_ON, RCMD_LIGHT_OFF,       // one output by number ("on 3"); the digit is pendingRemoteArg[0]
   RCMD_NAME,      // "name 1 Porch Light": rename an output (digit + text in pendingRemoteArg)
+  RCMD_SYNC,      // "sync": check GitHub now for new card files (and firmware)
   RCMD_SETUP,     // installer: "setup outputs 4" / "setup bell off" -> NVS, restart (pendingRemoteArg: "o4" / "b0")
   RCMD_UNKNOWN
 };
@@ -5069,6 +5330,7 @@ static void remoteHandleStreamLine(const char *line, time_t minTime) {
   else if (strcmp(cmd, "on") == 0 || strcmp(cmd, "lights on") == 0) pendingRemoteCommand = RCMD_LIGHTS_ON;
   else if (strstr(cmd, "help"))                          pendingRemoteCommand = RCMD_HELP;
   else if (strstr(cmd, "upgrade") || strstr(cmd, "install")) pendingRemoteCommand = RCMD_UPGRADE;
+  else if (strcmp(cmd, "sync") == 0) pendingRemoteCommand = RCMD_SYNC;
   else if (strstr(cmd, "restart") || strstr(cmd, "reboot")) pendingRemoteCommand = RCMD_RESTART;
   else if (strstr(cmd, "update"))                        pendingRemoteCommand = RCMD_UPDATE_PORTAL;
   else if (strstr(cmd, "off"))                           pendingRemoteCommand = RCMD_LIGHTS_OFF;
@@ -5359,14 +5621,14 @@ static void updateHealthLog() {
 
   unsigned stackFree = remoteTaskHandle
       ? (unsigned)uxTaskGetStackHighWaterMark(remoteTaskHandle) : 0;
-  char d[120];
-  snprintf(d, sizeof(d), "heap %uK min %uK blk %uK|stk %u lstk %u|pcf %s r%u|i2c %u tch %u|link %u|wifi %u|push %u/%u(%d)",
+  char d[136];
+  snprintf(d, sizeof(d), "heap %uK min %uK blk %uK|stk %u lstk %u|pcf %s r%u|i2c %u tch %u pir %u|link %u|wifi %u|push %u/%u(%d)",
            (unsigned)(ESP.getFreeHeap() / 1024),
            (unsigned)(ESP.getMinFreeHeap() / 1024),
            (unsigned)(ESP.getMaxAllocHeap() / 1024),
            stackFree, (unsigned)uxTaskGetStackHighWaterMark(NULL),
            pcfOnline ? "ok" : "FAIL", (unsigned)pcfStateRestores,
-           (unsigned)i2cResetCount, (unsigned)touchRejectCount,
+           (unsigned)i2cResetCount, (unsigned)touchRejectCount, (unsigned)motionShortPulses,
            (unsigned)statListenerReconnects, (unsigned)statWifiReconnects,
            (unsigned)statPushOk, (unsigned)statPushFail, statPushLastFailCode);
   logActivityEvent("HEALTH", d);
@@ -5396,7 +5658,7 @@ static void fwBaseUrl(char *out, size_t n) {
 // Core-0 worker: fetch manifest.json and report whether a newer version
 // exists. Tiny request, ~1s, run from the daily check and before any upgrade.
 static FwManifest fwFetchManifest() {
-  FwManifest m; m.ok = false; m.version[0] = 0; m.size = 0; m.md5[0] = 0;
+  FwManifest m; m.ok = false; m.version[0] = 0; m.size = 0; m.md5[0] = 0; m.festivals[0] = 0; m.assets[0] = 0;
   char url[200];
   fwBaseUrl(url, sizeof(url));
   strncat(url, FW_MANIFEST_PATH, sizeof(url) - strlen(url) - 1);
@@ -5425,6 +5687,7 @@ static FwManifest fwFetchManifest() {
       m.size = doc["size"] | 0;
       strncpy(m.md5, doc["md5"] | "", sizeof(m.md5) - 1);
       strncpy(m.festivals, doc["festivals"] | "", sizeof(m.festivals) - 1);
+      strncpy(m.assets, doc["assets"] | "", sizeof(m.assets) - 1);
       m.ok = m.version[0] != 0;
     }
   }
@@ -5463,56 +5726,72 @@ static void fwSyncFestivalConfig(const char *stamp) {
   if (code != 200) { http.end(); return; }
   String body = http.getString();
   http.end();
-
   if (body.length() < 8 || body.length() > 12000) return;
+  // Hand the body to loop(); validation and the card write happen there.
+  char *copy = (char *)ps_malloc(body.length() + 1);
+  if (!copy) return;
+  memcpy(copy, body.c_str(), body.length() + 1);
+  festPendingBody = copy;
+  festPendingLen  = body.length();
+  festBodyReady   = true;
+}
 
-  // Validate every line.
+// loop(): validate the fetched festival file and swap it onto the card.
+// Accepted only if EVERY line is blank, a comment, or
+// "key,YYYY-MM-DD,YYYY-MM-DD" with sane dates -- a typo in the repo can never
+// blank out the calendar. Replaced only when the bytes differ.
+static void applyFestivalBody() {
+  char *body = festPendingBody;
+  size_t blen = festPendingLen;
+  festPendingBody = nullptr; festPendingLen = 0; festBodyReady = false;
+  if (!body) return;
+
   int valid = 0;
-  const char *pStr = body.c_str();
+  const char *pStr = body;
   while (*pStr) {
     const char *nl = strchr(pStr, '\n');
     size_t len = nl ? (size_t)(nl - pStr) : strlen(pStr);
     char line[128];
-    if (len >= sizeof(line)) return;                  // absurd line: reject file
+    if (len >= sizeof(line)) { free(body); return; }  // absurd line: reject file
     memcpy(line, pStr, len); line[len] = '\0';
     while (len > 0 && (line[len - 1] == '\r' || line[len - 1] == ' ')) line[--len] = '\0';
     if (len > 0 && line[0] != '#') {
       char key[28] = {0}, a[12] = {0}, b[12] = {0};
-      if (sscanf(line, "%27[^,],%11[^,],%11[^,]", key, a, b) != 3) return;
+      if (sscanf(line, "%27[^,],%11[^,],%11[^,]", key, a, b) != 3) { free(body); return; }
       int ya = parseYmd(a), yb = parseYmd(b);
-      if (ya < 20000101 || yb < ya || yb > 21001231) return;
+      if (ya < 20000101 || yb < ya || yb > 21001231) { free(body); return; }
       valid++;
     }
     if (!nl) break;
     pStr = nl + 1;
   }
-  if (valid == 0) return;
+  if (valid == 0 || !sdMounted) { free(body); return; }
 
   // Same as what is on the card already? Then nothing to do.
   File cur = SD.open("/config/festivals.txt", FILE_READ);
   if (cur) {
-    bool same = (cur.size() == body.length());
+    bool same = (cur.size() == blen);
     if (same) {
       size_t off = 0; uint8_t chunk[256];
-      const char *src = body.c_str();
       while (same && cur.available()) {
         int n = cur.read(chunk, sizeof(chunk));
         if (n <= 0) break;
-        if (memcmp(chunk, src + off, n) != 0) same = false;
+        if (memcmp(chunk, body + off, n) != 0) same = false;
         off += n;
       }
     }
     cur.close();
-    if (same) { festivalConfigSynced = 2; return; }   // card already matches: just remember the stamp
+    if (same) { free(body); festivalConfigSynced = 2; return; }
   }
 
   SD.mkdir("/config");
   SD.remove("/config/festivals.tmp");
   File f = SD.open("/config/festivals.tmp", FILE_WRITE);
-  if (!f) return;
-  size_t wrote = f.print(body);
+  if (!f) { free(body); return; }
+  size_t wrote = f.write((const uint8_t *)body, blen);
   f.close();
-  if (wrote != body.length()) { SD.remove("/config/festivals.tmp"); return; }
+  free(body);
+  if (wrote != blen) { SD.remove("/config/festivals.tmp"); return; }
   SD.remove("/config/festivals.txt");
   if (SD.rename("/config/festivals.tmp", "/config/festivals.txt")) festivalConfigSynced = 1;
 }
@@ -5524,6 +5803,7 @@ static void fwCheckTask(void *param) {
   if (m.ok && m.festivals[0] != '\0' && strcmp(m.festivals, festivalConfigVer) != 0) {
     fwSyncFestivalConfig(m.festivals);
   }
+  if (m.ok) strncpy(assetsRemoteStamp, m.assets, sizeof(assetsRemoteStamp) - 1);
   xSemaphoreGive(tlsGate);
   fwResultFromSilentCheck = true;   // read by processFirmwareUpdateResults()
   if (!m.ok) {
@@ -5548,6 +5828,106 @@ static void fwCheckTask(void *param) {
 // downloads die at random byte counts.
 static uint8_t *fwStagedBuf = nullptr;
 static size_t   fwStagedLen = 0;
+
+// RESUMABLE download into PSRAM, in 64 KB Range requests over one kept-
+// alive TLS connection. A wall panel on weak Wi-Fi cannot hold a long
+// stream open -- it stalls, and every stall used to cost a 10 s wait plus
+// a fresh handshake. Short requests bound the damage: a stall loses at most
+// 64 KB of time, the connection is reused while it lives, and progress is
+// never thrown away. The budget is progress, not a count: it stops only
+// after six requests in a row that gained nothing, or fifteen minutes in
+// all. Modem power-save is off for the duration and restored afterwards.
+// The caller holds tlsGate. Returns the bytes received.
+static size_t httpsRangedDownload(const char *url, uint8_t *buf, size_t size, volatile uint8_t *pct, DlStats *st) {
+  const size_t CHUNK = 65536;
+  const int MAX_IDLE_ATTEMPTS = 6;
+  const unsigned long MAX_TOTAL_MS = 15UL * 60UL * 1000UL;
+  size_t total = 0;
+  int lastCode = 0, attempts = 0, idle = 0, reconnects = 0;
+  unsigned long startedAt = millis();
+  bool sleepWas = WiFi.getSleep();
+  WiFi.setSleep(false);
+
+  WiFiClientSecure *client = nullptr;
+  HTTPClient *http = nullptr;
+  auto dropConnection = [&]() {
+    if (http)   { http->end(); delete http; http = nullptr; }
+    if (client) { client->stop(); delete client; client = nullptr; }
+  };
+
+  while (total < size && idle < MAX_IDLE_ATTEMPTS && millis() - startedAt < MAX_TOTAL_MS) {
+    attempts++;
+    size_t before = total;
+    if (WiFi.status() != WL_CONNECTED) { lastCode = -100; idle++; dropConnection(); vTaskDelay(pdMS_TO_TICKS(2000)); continue; }
+
+    if (!client) {
+      if (attempts > 1) { reconnects++; vTaskDelay(pdMS_TO_TICKS(1500 + 1500UL * idle)); }
+      client = new WiFiClientSecure();
+      client->setInsecure();
+      client->setHandshakeTimeout(12);
+      http = new HTTPClient();
+      http->setConnectTimeout(10000);
+      http->setTimeout(8000);
+      http->setReuse(true);                              // keep the TLS session for the next range
+      http->setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+    }
+    // begin() per request: it resets the header list (so Range does not pile
+    // up) and keeps the connection when the host is unchanged.
+    if (!http->begin(*client, url)) { lastCode = -101; idle++; dropConnection(); continue; }
+
+    size_t want = size - total;
+    if (want > CHUNK) want = CHUNK;
+    char range[48];
+    snprintf(range, sizeof(range), "bytes=%u-%u", (unsigned)total, (unsigned)(total + want - 1));
+    http->addHeader("Range", range);
+    int code = http->GET();
+    lastCode = code;
+    if (code == 200) total = 0;                          // Range ignored: whole file from the start
+    if (code != 200 && code != 206) { idle++; dropConnection(); continue; }
+
+    WiFiClient *stream = http->getStreamPtr();
+    size_t expect = (code == 206) ? want : size;
+    size_t got = 0;
+    unsigned long lastDataAt = millis();
+    while (got < expect && total < size) {
+      size_t avail = stream->available();
+      if (avail) {
+        size_t n = expect - got;
+        if (n > avail)  n = avail;
+        if (n > 16384)  n = 16384;
+        int r = stream->readBytes(buf + total, n);
+        if (r <= 0) break;
+        total += r; got += r;
+        if (pct) *pct = (uint8_t)((total * 100ULL) / size);
+        lastDataAt = millis();
+      } else {
+        if (!http->connected() && stream->available() == 0) break;
+        if (millis() - lastDataAt > 6000UL) break;      // stalled: drop and ask again
+        vTaskDelay(pdMS_TO_TICKS(2));
+      }
+    }
+    if (got < expect) dropConnection();                  // short or stalled: fresh connection next time
+    else http->end();                                    // request done; the TLS session stays for the next one
+    idle = (total > before) ? 0 : idle + 1;
+  }
+  dropConnection();
+  WiFi.setSleep(sleepWas);
+  if (st) { st->lastCode = lastCode; st->attempts = attempts; st->reconnects = reconnects; st->ms = millis() - startedAt; }
+  return total;
+}
+
+// MD5 of a buffer as 32 lowercase hex characters. MD5Builder::add() takes a
+// 16-bit length on this core, so it is fed in 32 KB pieces.
+static void md5Hex(const uint8_t *buf, size_t len, char *out33) {
+  MD5Builder md5;
+  md5.begin();
+  for (size_t off = 0; off < len; off += 32768) {
+    size_t n = len - off; if (n > 32768) n = 32768;
+    md5.add((uint8_t *)buf + off, (uint16_t)n);
+  }
+  md5.calculate();
+  md5.getChars(out33);
+}
 
 static void fwUpgradeTask(void *param) {
   (void)param;
@@ -5597,89 +5977,11 @@ static void fwUpgradeTask(void *param) {
     snprintf(url + L, sizeof(url) - L, "?v=%s", m.md5[0] ? m.md5 : m.version);
   }
 
-  // RESUMABLE download into PSRAM, in 64 KB Range requests over one kept-
-  // alive TLS connection. A wall panel on weak Wi-Fi cannot hold a 1.3 MB
-  // stream open -- it stalls, and every stall used to cost a 10 s wait plus
-  // a fresh handshake, which is how a download took sixteen minutes. Short
-  // requests bound the damage: a stall loses at most 64 KB of time, the
-  // connection is reused while it lives, and progress is never thrown away.
-  // The budget is progress, not a count: we stop only after six requests in
-  // a row that gained nothing, or fifteen minutes in all. Modem power-save
-  // is off for the duration and restored afterwards.
-  const size_t CHUNK = 65536;
-  const int MAX_IDLE_ATTEMPTS = 6;
-  const unsigned long MAX_TOTAL_MS = 15UL * 60UL * 1000UL;
-  size_t total = 0;
-  int lastCode = 0, attempts = 0, idle = 0, reconnects = 0;
-  unsigned long startedAt = millis();
-  bool sleepWas = WiFi.getSleep();
-  WiFi.setSleep(false);
-
-  WiFiClientSecure *client = nullptr;
-  HTTPClient *http = nullptr;
-  auto dropConnection = [&]() {
-    if (http)   { http->end(); delete http; http = nullptr; }
-    if (client) { client->stop(); delete client; client = nullptr; }
-  };
-
-  while (total < m.size && idle < MAX_IDLE_ATTEMPTS && millis() - startedAt < MAX_TOTAL_MS) {
-    attempts++;
-    size_t before = total;
-    if (WiFi.status() != WL_CONNECTED) { lastCode = -100; idle++; dropConnection(); vTaskDelay(pdMS_TO_TICKS(2000)); continue; }
-
-    if (!client) {
-      if (attempts > 1) { reconnects++; vTaskDelay(pdMS_TO_TICKS(1500 + 1500UL * idle)); }
-      client = new WiFiClientSecure();
-      client->setInsecure();
-      client->setHandshakeTimeout(12);
-      http = new HTTPClient();
-      http->setConnectTimeout(10000);
-      http->setTimeout(8000);
-      http->setReuse(true);                              // keep the TLS session for the next range
-      http->setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-    }
-    // begin() per request: it resets the header list (so Range does not pile
-    // up) and keeps the connection when the host is unchanged.
-    if (!http->begin(*client, url)) { lastCode = -101; idle++; dropConnection(); continue; }
-
-    size_t want = m.size - total;
-    if (want > CHUNK) want = CHUNK;
-    char range[48];
-    snprintf(range, sizeof(range), "bytes=%u-%u", (unsigned)total, (unsigned)(total + want - 1));
-    http->addHeader("Range", range);
-    int code = http->GET();
-    lastCode = code;
-    if (code == 200) total = 0;                          // Range ignored: whole file from the start
-    if (code != 200 && code != 206) { idle++; dropConnection(); continue; }
-
-    WiFiClient *stream = http->getStreamPtr();
-    size_t expect = (code == 206) ? want : m.size;
-    size_t got = 0;
-    unsigned long lastDataAt = millis();
-    while (got < expect && total < m.size) {
-      size_t avail = stream->available();
-      if (avail) {
-        size_t n = expect - got;
-        if (n > avail)  n = avail;
-        if (n > 16384)  n = 16384;
-        int r = stream->readBytes(img + total, n);
-        if (r <= 0) break;
-        total += r; got += r;
-        firmwareDownloadPct = (uint8_t)((total * 100ULL) / m.size);
-        lastDataAt = millis();
-      } else {
-        if (!http->connected() && stream->available() == 0) break;
-        if (millis() - lastDataAt > 6000UL) break;      // stalled: drop and ask again
-        vTaskDelay(pdMS_TO_TICKS(2));
-      }
-    }
-    if (got < expect) dropConnection();                  // short or stalled: fresh connection next time
-    else http->end();                                    // request done; the TLS session stays for the next one
-    idle = (total > before) ? 0 : idle + 1;
-  }
-  dropConnection();
-  WiFi.setSleep(sleepWas);
+  DlStats ds;
+  size_t total = httpsRangedDownload(url, img, m.size, &firmwareDownloadPct, &ds);
   xSemaphoreGive(tlsGate);   // network part is over; verification needs no TLS
+  int lastCode = ds.lastCode, attempts = ds.attempts, reconnects = ds.reconnects;
+  unsigned long startedAt = millis() - ds.ms;
 
   snprintf(fwDownloadStats, sizeof(fwDownloadStats), "Download: %u KB in %lu s, %d requests, %d reconnects",
            (unsigned)(total / 1024), (millis() - startedAt) / 1000UL, attempts, reconnects);
@@ -5695,14 +5997,9 @@ static void fwUpgradeTask(void *param) {
   // over a 1.3MB image silently hashes only the low 16 bits' worth of it
   // (12,832 bytes of 1,323,552) and the checksum can never match. Feed it
   // in 32KB pieces.
-  MD5Builder md5;
-  md5.begin();
-  for (size_t off = 0; off < total; off += 32768) {
-    size_t n = total - off; if (n > 32768) n = 32768;
-    md5.add(img + off, (uint16_t)n);
-  }
-  md5.calculate();
-  if (m.md5[0] && !md5.toString().equalsIgnoreCase(m.md5)) {
+  char got[33];
+  md5Hex(img, total, got);
+  if (m.md5[0] && strcasecmp(got, m.md5) != 0) {
     free(img);
     snprintf(firmwareUpdateMsg, sizeof(firmwareUpdateMsg), "Checksum mismatch -- download discarded");
     firmwareUpdateResult = FWR_FAILED; firmwareDownloadActive = false; vTaskDelete(nullptr); return;
@@ -5789,7 +6086,7 @@ void startFirmwareUpdateCheck() {
   xTaskCreatePinnedToCore(fwCheckTask, "fwCheck", 10240, nullptr, 1, nullptr, 0);
 }
 
-// Weekly, Sunday at UPDATE_CHECK_HOUR:30 local. Notifies ONCE per new version.
+// Daily at UPDATE_CHECK_HOUR:30 local (card files arrive within a day). Notifies ONCE per new version.
 // The phone page checks on demand whenever it is opened, so this is only the
 // safety net for households that never open it.
 static void updateFirmwareUpdateCheck() {
@@ -5814,15 +6111,304 @@ static void updateFirmwareUpdateCheck() {
 
   struct tm t;
   getLocalTmFast(&t);
-  if (t.tm_wday != 0 || t.tm_hour != UPDATE_CHECK_HOUR || t.tm_min != 30) return;
+  if (t.tm_hour != UPDATE_CHECK_HOUR || t.tm_min != 30) return;   // daily: the manifest read is a few hundred bytes
   if (t.tm_yday == lastCheckedDay) return;
   lastCheckedDay = t.tm_yday;
   startFirmwareUpdateCheck();
 }
 
+// =====================================================
+// Card files from GitHub
+// =====================================================
+// Phases (assetPhase):
+//   0 idle            loop starts the list worker when a sync is requested
+//   1 listing         worker: fetch + validate firmware/assets.txt
+//   2 deciding        loop:   next entry -- skip, hash the card copy, or fetch
+//   3 hashing         loop:   MD5 of the card copy, 8 KB per tick
+//   4 fetching        worker: download one file into PSRAM, verify MD5
+//   5 writing         loop:   write it to path.tmp, 8 KB per tick, then swap
+//   6 finishing       loop:   new index, stamp, log, refresh
+//   9 failed          loop:   tidy up, try again at the next check
+// Network work runs on core 0 under tlsGate; every SD operation is on the UI
+// thread in small slices, so the screen never stalls.
+
+static bool assetPathAllowed(const char *p) {
+  size_t n = strlen(p);
+  if (n < 6 || n >= sizeof(((AssetEntry *)0)->path) || strstr(p, "..")) return false;
+  for (size_t i = 0; i < n; i++) {
+    char c = p[i];
+    if (!(isalnum((unsigned char)c) || c == '/' || c == '_' || c == '-' || c == '.')) return false;
+  }
+  for (size_t r = 0; r < sizeof(ASSET_ROOTS) / sizeof(ASSET_ROOTS[0]); r++)
+    if (strncmp(p, ASSET_ROOTS[r], strlen(ASSET_ROOTS[r])) == 0) return true;
+  return false;
+}
+
+static void assetUrl(char *out, size_t n, const char *path, const char *ver) {
+  fwBaseUrl(out, n);
+  size_t L = strlen(out);
+  snprintf(out + L, n - L, "%s%s?v=%s", ASSET_DIR_URL, path, ver);
+}
+
+// Worker: fetch and parse the list.
+static void assetListTask(void *param) {
+  (void)param;
+  xSemaphoreTake(tlsGate, portMAX_DELAY);
+  char url[200];
+  fwBaseUrl(url, sizeof(url));
+  size_t L = strlen(url);
+  snprintf(url + L, sizeof(url) - L, "%s?v=%s", ASSET_LIST_PATH, assetsRemoteStamp);
+  String body;
+  {
+    WiFiClientSecure client;
+    client.setInsecure();
+    client.setTimeout(10000);
+    HTTPClient http;
+    http.setConnectTimeout(10000);
+    http.setTimeout(10000);
+    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+    if (http.begin(client, url)) {
+      if (http.GET() == 200) body = http.getString();
+      http.end();
+    }
+  }
+  xSemaphoreGive(tlsGate);
+
+  uint16_t cap = 0;
+  for (size_t i = 0; i < body.length(); i++) if (body[i] == '\n') cap++;
+  cap++;
+  if (body.length() < 10 || cap > 400) { assetPhase = 9; vTaskDelete(nullptr); return; }
+  AssetEntry *list = (AssetEntry *)ps_calloc(cap, sizeof(AssetEntry));
+  if (!list) { assetPhase = 9; vTaskDelete(nullptr); return; }
+  uint16_t n = 0;
+  const char *p = body.c_str();
+  while (*p && n < cap) {
+    const char *nl = strchr(p, '\n');
+    size_t len = nl ? (size_t)(nl - p) : strlen(p);
+    char line[128];
+    if (len > 0 && len < sizeof(line) && p[0] != '#') {
+      memcpy(line, p, len); line[len] = '\0';
+      unsigned long sz = 0; char md5[40] = {0}, path[80] = {0};
+      if (sscanf(line, "%lu %39s %79s", &sz, md5, path) == 3 && strlen(md5) == 32 &&
+          sz > 0 && sz <= 3000000UL && assetPathAllowed(path)) {
+        AssetEntry &e = list[n++];
+        strncpy(e.path, path, sizeof(e.path) - 1);
+        strncpy(e.md5, md5, 32);
+        e.size = sz;
+      }
+    }
+    if (!nl) break;
+    p = nl + 1;
+  }
+  assetList = list; assetCount = n; assetIdx = 0; assetChanged = 0; assetFailed = 0;
+  assetPhase = 2;
+  vTaskDelete(nullptr);
+}
+
+// Worker: one file into PSRAM, verified.
+static void assetFileTask(void *param) {
+  (void)param;
+  AssetEntry &e = assetList[assetIdx];
+  uint8_t *buf = (uint8_t *)ps_malloc(e.size);
+  if (!buf) { assetFailed++; assetIdx++; assetPhase = 2; vTaskDelete(nullptr); return; }
+  char url[220];
+  assetUrl(url, sizeof(url), e.path, e.md5);
+  xSemaphoreTake(tlsGate, portMAX_DELAY);
+  DlStats ds;
+  size_t got = httpsRangedDownload(url, buf, e.size, nullptr, &ds);
+  xSemaphoreGive(tlsGate);
+  char sum[33] = "";
+  if (got == e.size) md5Hex(buf, got, sum);
+  if (got != e.size || strcasecmp(sum, e.md5) != 0) {
+    free(buf);
+    assetFailed++; assetIdx++; assetPhase = 2;
+    vTaskDelete(nullptr); return;
+  }
+  assetBuf = buf; assetBufLen = got;
+  assetPhase = 5;
+  vTaskDelete(nullptr);
+}
+
+// Make every directory on the way to path (SD.mkdir does one level).
+static void assetMkdirs(const char *path) {
+  char d[64];
+  for (const char *q = strchr(path + 1, '/'); q; q = strchr(q + 1, '/')) {
+    size_t n = q - path;
+    if (n >= sizeof(d)) return;
+    memcpy(d, path, n); d[n] = '\0';
+    if (!SD.exists(d)) SD.mkdir(d);
+  }
+}
+
+static bool assetIndexHas(const AssetEntry &e) {
+  if (!assetIndexText) return false;
+  char needle[110];
+  snprintf(needle, sizeof(needle), "\n%s %s\n", e.md5, e.path);
+  return strstr(assetIndexText, needle) != nullptr;
+}
+
+static void assetLoadIndex() {
+  if (assetIndexText) { free(assetIndexText); assetIndexText = nullptr; }
+  File f = SD.open(ASSET_INDEX, FILE_READ);
+  size_t sz = f ? f.size() : 0;
+  assetIndexText = (char *)ps_malloc(sz + 3);
+  if (!assetIndexText) { if (f) f.close(); return; }
+  assetIndexText[0] = '\n';
+  size_t n = f ? f.read((uint8_t *)assetIndexText + 1, sz) : 0;
+  if (f) f.close();
+  assetIndexText[1 + n] = '\n';
+  assetIndexText[2 + n] = '\0';
+}
+
+static void assetFinish(bool ok) {
+  if (assetList && ok) {
+    // The new index lists exactly what was verified this run.
+    SD.mkdir("/sys");
+    SD.remove("/sys/assets.tmp");
+    File f = SD.open("/sys/assets.tmp", FILE_WRITE);
+    if (f) {
+      for (uint16_t i = 0; i < assetCount; i++)
+        if (assetList[i].ok) { f.print(assetList[i].md5); f.print(' '); f.print(assetList[i].path); f.print('\n'); }
+      f.close();
+      SD.remove(ASSET_INDEX);
+      SD.rename("/sys/assets.tmp", ASSET_INDEX);
+    }
+    if (assetFailed == 0) {
+      strncpy(assetsVer, assetsRemoteStamp, sizeof(assetsVer) - 1);
+      prefs.begin("doorpanel", false);
+      prefs.putString("assetVer", assetsVer);
+      prefs.end();
+    }
+  }
+  char d[96];
+  if (!ok)                 snprintf(d, sizeof(d), "Card files: could not read the list from GitHub");
+  else if (assetFailed)    snprintf(d, sizeof(d), "Card files: %u updated, %u failed (retried at the next check)", assetChanged, assetFailed);
+  else                     snprintf(d, sizeof(d), "Card files: %u updated, %u checked", assetChanged, assetCount);
+  if (!ok || assetChanged || assetFailed) logActivityEvent("UPDATE", d);
+  if (assetSyncReply) { assetSyncReply = false; sendRemoteReply(assetChanged || !ok || assetFailed ? d : "Panel files are already up to date."); }
+  if (assetChanged) applyTheme(true);              // new wallpapers show at once
+  if (assetList) { free(assetList); assetList = nullptr; }
+  if (assetIndexText) { free(assetIndexText); assetIndexText = nullptr; }
+  assetCount = assetIdx = 0;
+  assetPhase = 0;
+}
+
+// loop(): drive the sync. Everything here is short; SD work is sliced.
+static void updateAssetSync() {
+  static File io;
+  static size_t ioOff = 0;
+  static MD5Builder hasher;
+
+  switch (assetPhase) {
+    case 0:
+      if (!assetSyncRequested || !sdMounted || WiFi.status() != WL_CONNECTED) return;
+      if (firmwareDownloadActive || fwStaging || firmwareUpdateRunning) return;
+      assetSyncRequested = false;
+      assetPhase = 1;
+      assetLoadIndex();
+      if (xTaskCreatePinnedToCore(assetListTask, "assetList", 10240, nullptr, 1, nullptr, 0) != pdPASS) assetPhase = 9;
+      return;
+
+    case 2: {
+      if (firmwareDownloadActive || fwStaging) return;  // a firmware update goes first
+      for (uint8_t step = 0; step < 4 && assetIdx < assetCount; step++) {   // a few entries per tick
+        AssetEntry &e = assetList[assetIdx];
+        File cur = SD.open(e.path, FILE_READ);
+        size_t have = cur ? cur.size() : 0;
+        if (cur) cur.close();
+        if (have == e.size && assetIndexHas(e)) { e.ok = true; assetIdx++; continue; }   // verified before
+        if (have == e.size) {                                   // there, but never verified: hash it
+          io = SD.open(e.path, FILE_READ);
+          if (io) { hasher.begin(); assetPhase = 3; return; }
+        }
+        uint64_t freeB = SD.totalBytes() - SD.usedBytes();
+        if (freeB < (uint64_t)e.size + 1048576ULL) { assetFailed++; assetIdx++; continue; }
+        assetPhase = 4;
+        if (xTaskCreatePinnedToCore(assetFileTask, "assetGet", 10240, nullptr, 1, nullptr, 0) != pdPASS) {
+          assetFailed++; assetIdx++; assetPhase = 2;
+        }
+        return;
+      }
+      if (assetIdx >= assetCount) assetPhase = 6;
+      return;
+    }
+
+    case 3: {                                                   // hash the card copy, 8 KB a tick
+      static uint8_t chunk[8192];                               // static: off the UI task's stack
+      int n = io.read(chunk, sizeof(chunk));
+      if (n > 0) { hasher.add(chunk, (uint16_t)n); return; }
+      io.close();
+      hasher.calculate();
+      AssetEntry &e = assetList[assetIdx];
+      if (hasher.toString().equalsIgnoreCase(e.md5)) { e.ok = true; assetIdx++; assetPhase = 2; return; }
+      assetPhase = 4;                                           // differs: fetch it
+      if (xTaskCreatePinnedToCore(assetFileTask, "assetGet", 10240, nullptr, 1, nullptr, 0) != pdPASS) {
+        assetFailed++; assetIdx++; assetPhase = 2;
+      }
+      return;
+    }
+
+    case 5: {                                                   // write, 8 KB a tick, then swap
+      AssetEntry &e = assetList[assetIdx];
+      static char tmp[72];
+      if (!io) {
+        snprintf(tmp, sizeof(tmp), "%s.tmp", e.path);
+        assetMkdirs(e.path);
+        SD.remove(tmp);
+        io = SD.open(tmp, FILE_WRITE);
+        ioOff = 0;
+        if (!io) { free(assetBuf); assetBuf = nullptr; assetFailed++; assetIdx++; assetPhase = 2; return; }
+      }
+      if (ioOff < assetBufLen) {
+        size_t n = assetBufLen - ioOff; if (n > 8192) n = 8192;
+        if (io.write(assetBuf + ioOff, n) != n) {
+          io.close(); SD.remove(tmp);
+          free(assetBuf); assetBuf = nullptr; assetFailed++; assetIdx++; assetPhase = 2; return;
+        }
+        ioOff += n;
+        return;
+      }
+      io.close();
+      free(assetBuf); assetBuf = nullptr;
+      SD.remove(e.path);
+      if (SD.rename(tmp, e.path)) {
+        e.ok = true; assetChanged++;
+        if (strncmp(e.path, "/icons/", 7) == 0 || strncmp(e.path, "/ui/", 4) == 0) assetNeedsRestart = true;
+        if (strncmp(e.path, "/bg/", 4) == 0 || strncmp(e.path, "/festival/", 10) == 0) bgContentChanged = true;
+      } else {
+        assetFailed++;
+      }
+      assetIdx++;
+      assetPhase = 2;
+      return;
+    }
+
+    case 6: assetFinish(true);  return;
+    case 9: assetFinish(false); return;
+    default: return;                                            // 1, 4: a worker is busy
+  }
+}
+
+// New tile or bell art is only read when the screen is built, so it takes a
+// restart -- done when nobody is around: screen asleep, no motion for two
+// minutes, nothing in flight. Lights put on by hand come back on their own
+// (restore after restart).
+static void updateAssetRestart() {
+  if (!assetNeedsRestart || assetPhase != 0) return;
+  if (!screenDimmed || motionStableState || restorePending) return;
+  if (firmwareDownloadActive || fwStaging || firmwareUpdateRunning) return;
+  if (lastMotionSeenAt != 0 && millis() - lastMotionSeenAt < 120000UL) return;
+  if (assetRestartArmedAt == 0) { assetRestartArmedAt = millis(); return; }
+  if (millis() - assetRestartArmedAt < 5000UL) return;
+  logActivityEvent("UPDATE", "Restarting to show new tile artwork");
+  delay(300);
+  ESP.restart();
+}
+
 // loop(): act on whatever the workers reported. UI, pushes and the restart
 // all happen here, on the LVGL thread.
 static void processFirmwareUpdateResults() {
+  if (festBodyReady) applyFestivalBody();
   if (festivalConfigSynced) {
     uint8_t how = festivalConfigSynced;
     festivalConfigSynced = 0;
@@ -5858,6 +6444,15 @@ static void processFirmwareUpdateResults() {
   if (r == FWR_NONE) return;
   firmwareUpdateResult = FWR_NONE;
   bool silent = fwResultFromSilentCheck;
+
+  // Card files: any manifest read may reveal a new list.
+  if (r != FWR_FAILED && assetsRemoteStamp[0] && strcmp(assetsRemoteStamp, assetsVer) != 0) {
+    assetSyncRequested = true;
+  } else if (assetSyncReply) {
+    assetSyncReply = false;
+    sendRemoteReply(r == FWR_FAILED ? "Couldn't reach GitHub. Try again in a minute."
+                                    : "Panel files are already up to date.");
+  }
 
   // Diagnostics summary, whichever path produced the result.
   switch (r) {
@@ -6188,6 +6783,13 @@ static void processRemoteCommand() {
       startFirmwareUpgrade();
       break;
 
+    case RCMD_SYNC:
+      if (assetPhase != 0) { sendRemoteReply("Already fetching panel files."); break; }
+      assetSyncReply = true;
+      sendRemoteReply("Checking GitHub for new panel files.");
+      startFirmwareUpdateCheck();
+      break;
+
     case RCMD_VERSION:
       queueStateReply();
       break;
@@ -6201,6 +6803,7 @@ static void processRemoteCommand() {
         "status = how I'm doing\n"
         "restart = reboot\n"
         "upgrade = install the latest firmware\n"
+        "sync = fetch new panel files from GitHub\n"
         "update = open the update portal (5 min)");
       break;
     }
@@ -7415,10 +8018,9 @@ const uint8_t MOTION_HOLD_TIER_COUNT = sizeof(MOTION_HOLD_TIERS) / sizeof(MOTION
 // PIR sensitivity tiers -- raw consecutive 50ms HIGH samples required
 // before motion is confirmed (the original, stable v1 detection logic --
 // see updateMotionSensor()). Lower sample count = triggers faster = more
-// sensitive. Medium (10 samples / 500ms) matches v1's fixed factory
-// default exactly, so a unit that has never touched this setting behaves
-// identically to the original stable firmware.
-const uint8_t PIR_TIERS[] = {30, 20, 10}; // raw consecutive 50ms samples (1000ms / 500ms / 250ms)
+// sensitive.
+// 5.9.4: raised from {30, 20, 10} -- false triggers from the MH-SR505.
+const uint8_t PIR_TIERS[] = {32, 24, 16}; // raw consecutive 50ms samples (1.6 s / 1.2 s / 0.8 s)
 const char *PIR_TIER_NAMES[] = {"Low", "Medium", "High"};
 const uint8_t PIR_TIER_COUNT = sizeof(PIR_TIERS) / sizeof(PIR_TIERS[0]);
 
@@ -9721,6 +10323,13 @@ void updateMotionSensor() {
   if (rawNow != motionRawState) {
     motionRawState = rawNow;
     lastMotionRawChangeAt = millis();
+    if (rawNow) {
+      if (!motionStableState) motionRawRiseAt = millis();
+    } else {
+      motionRawFallAt = millis();
+      // A pulse that never reached confirmation: counted, not acted on.
+      if (!motionStableState && motionArmedAfterBootClear && motionShortPulses < 65535) motionShortPulses++;
+    }
   }
   // PIR warm-up protection:
   // Many PIR modules boot HIGH for a while. During warm-up, ignore motion
@@ -9795,6 +10404,16 @@ void updateMotionSensor() {
       }
     } else {
       motionClearedAt = millis();
+      // How long the sensor actually held HIGH for this event: rise of the
+      // pulse that confirmed it to the last fall. One number per event, so a
+      // day of the log shows the module's real hold time and whether false
+      // triggers are single pulses or re-triggered runs.
+      if (motionRawRiseAt != 0 && motionRawFallAt > motionRawRiseAt) {
+        unsigned long len = motionRawFallAt - motionRawRiseAt;
+        char d[48];
+        snprintf(d, sizeof(d), "Motion cleared after %lu.%lu s", len / 1000UL, (len % 1000UL) / 100UL);
+        logActivityEvent("MOTION", d);
+      }
     }
   }
 
@@ -9854,11 +10473,7 @@ void updateAutoLightManualHoldTimer() {
 
       applyAutoOutput(false);
       updateAutoLightUI();
-      if (!screenDimmed) {
-        char note[48];
-        snprintf(note, sizeof(note), "%s back on Auto", outputs[motionTarget].name);
-        showToast(note);
-      }
+      if (!screenDimmed) showToast(outputs[motionTarget].name, "Automatic again", TOAST_AUTO);
     }
 
     return;
@@ -10212,6 +10827,7 @@ void setup() {
 }
 
 void loop() {
+  uiLoopRunning = true;                 // from here on, theme/wallpaper work runs in slices
   static uint32_t lastTick = millis();
   uint32_t now = millis();
   lv_tick_inc(now - lastTick);
@@ -10241,6 +10857,10 @@ void loop() {
   updateLogRetention();
   bootHealthyTick();
   restoreTick();
+  updateAssetSync();
+  updateAssetRestart();
+  bgLoadTick();
+  applyWeatherResult();
   updateSwitchDriverWatch();
   updateWeatherTicker();
   updateBacklightFade();
