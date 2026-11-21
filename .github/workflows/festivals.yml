@@ -1,0 +1,81 @@
+name: Festival calendar
+
+# Twice a year GitHub works out the next ten years of lunisolar festival
+# dates (Diwali, Holi, Navratri, Janmashtami, Ganesh Chaturthi, Rakhi) from
+# the Sun and Moon, checks them, and publishes config/festivals.txt. Panels
+# download the file only when its stamp in manifest.json changes -- in
+# practice once a year, on 1 January, when the window rolls forward.
+#
+# Nothing is published unless every check passes:
+#   1. self-test   the calculator reproduces 90 dates published by Drik
+#                  Panchang (New Delhi and three US cities), exactly
+#   2. sanity      every festival lands in its possible season and span
+#   3. stability   no date within the next 12 months moves silently
+#   4. validator   the same rules the panel applies before accepting a file
+# To correct a date by hand, add a line to config/festivals_overrides.txt.
+on:
+  push:                          # an override or a calculator change republishes at once
+    branches: [main]
+    paths: ["config/festivals_overrides.txt", "tools/festival_*", ".github/workflows/festivals.yml"]
+  schedule:
+    - cron: "23 1 1 1,7 *"       # 1 January and 1 July, 06:53 IST
+  workflow_dispatch:
+    inputs:
+      allow_changes:
+        description: "Allow a date in the next 12 months to move (after checking it)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  pages: write
+
+concurrency:
+  group: publish                  # never alongside a firmware build or publish
+  cancel-in-progress: false
+
+jobs:
+  calendar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install the ephemeris (pinned, in its own venv)
+        run: |
+          python3 -m venv "$RUNNER_TEMP/fc"
+          "$RUNNER_TEMP/fc/bin/pip" install --quiet "ephem==4.2.1"
+          echo "PY=$RUNNER_TEMP/fc/bin/python" >> "$GITHUB_ENV"
+
+      - name: Self-test against published dates
+        run: $PY -I tools/festival_calendar.py --selftest
+
+      - name: Write config/festivals.txt
+        id: cal
+        run: |
+          $PY -I tools/festival_calendar.py ${{ inputs.allow_changes && '--allow-changes' || '' }}
+
+      - name: Validate and stamp the manifest
+        id: pub
+        if: steps.cal.outputs.changed == 'true'
+        run: python3 -I tools/publish.py
+
+      - name: Commit
+        if: steps.cal.outputs.changed == 'true'
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add config/festivals.txt firmware/manifest.json
+          git commit -m "Festival calendar $(date -u +%Y-%m-%d)"
+          for i in 1 2 3; do
+            git push && break
+            git pull --rebase origin main || exit 1
+          done
+          echo "### Festival calendar published" >> "$GITHUB_STEP_SUMMARY"
+          grep -v '^#' config/festivals.txt | head -12 | sed 's/^/    /' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Redeploy page
+        if: steps.cal.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X POST "repos/${{ github.repository }}/pages/builds" || echo "Pages will pick it up on its own"

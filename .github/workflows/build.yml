@@ -39,6 +39,9 @@ jobs:
           test -f sketch/libraries/figtree_fonts/library.properties || ls sketch/libraries/figtree_fonts/*.h >/dev/null 2>&1 \
                                                 || { echo "::error::sketch/libraries/figtree_fonts is empty - copy the folder from d:\\sketchbook\\libraries"; exit 1; }
 
+      - name: Lint the sketch (prototype order, extern "C") -- seconds, before the long compile
+        run: python3 -I tools/lint_sketch.py sketch/Panel/Panel.ino
+
       - name: Install arduino-cli, ESP32 core and libraries
         run: |
           curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | BINDIR=/usr/local/bin sh
@@ -80,6 +83,14 @@ jobs:
           SZ=$(stat -c %s out/Panel.ino.bin)
           echo "app image: $SZ bytes"
           [ "$SZ" -gt 800000 ] && [ "$SZ" -lt 1966080 ] || { echo "::error::image size $SZ is outside the expected range"; exit 1; }
+          # Growth against what panels run now: a flag, never a block.
+          PREV=$(python3 -c "import json;print(json.load(open('firmware/manifest.json')).get('size',0))" 2>/dev/null || echo 0)
+          if [ "$PREV" -gt 0 ]; then
+            DELTA=$((SZ - PREV))
+            echo "change vs published: $DELTA bytes"
+            [ "$DELTA" -gt 8192 ] && echo "::warning::app image grew by $DELTA bytes (more than 8 KB) since the published build"
+          fi
+          true
           cp out/Panel.ino.bin firmware/Panel.ino.bin
 
       - name: Build manifest (version, size, md5 read from the binary)
