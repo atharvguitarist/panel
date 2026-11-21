@@ -1,0 +1,21 @@
+# Same rules, other places: Drik Panchang pages that opened on a US city.
+# Matching these shows the rules (not just the answers) agree with Drik.
+# place|year,event,date,source
+34.6868,-118.1542,America/Los_Angeles|2028,holika_dahan,2028-03-09,drik lancaster
+34.6868,-118.1542,America/Los_Angeles|2028,holi,2028-03-10,drik lancaster
+34.6868,-118.1542,America/Los_Angeles|2028,rakhi,2028-08-04,drik lancaster
+34.6868,-118.1542,America/Los_Angeles|2028,janmashtami_smarta,2028-08-12,drik lancaster
+34.6868,-118.1542,America/Los_Angeles|2028,janmashtami_sunrise,2028-08-13,drik lancaster iskcon
+34.6868,-118.1542,America/Los_Angeles|2028,ganesh_chaturthi,2028-08-23,drik lancaster
+34.6868,-118.1542,America/Los_Angeles|2028,ghatasthapana,2028-09-19,drik lancaster
+34.6868,-118.1542,America/Los_Angeles|2028,dussehra,2028-09-27,drik lancaster
+34.6868,-118.1542,America/Los_Angeles|2028,dhanteras,2028-10-15,drik lancaster
+34.6868,-118.1542,America/Los_Angeles|2028,diwali,2028-10-17,drik lancaster
+34.6868,-118.1542,America/Los_Angeles|2028,bhai_dooj,2028-10-19,drik lancaster
+34.6868,-118.1542,America/Los_Angeles|2029,rakhi,2029-08-23,drik lancaster
+34.6868,-118.1542,America/Los_Angeles|2029,dussehra,2029-10-16,drik lancaster
+34.6868,-118.1542,America/Los_Angeles|2030,holika_dahan,2030-03-18,drik lancaster
+34.6868,-118.1542,America/Los_Angeles|2030,holi,2030-03-19,drik lancaster
+33.5427,-117.7854,America/Los_Angeles|2034,dussehra,2034-10-22,drik laguna beach
+42.3223,-83.1763,America/Detroit|2031,ghatasthapana,2031-10-16,drik dearborn
+42.3223,-83.1763,America/Detroit|2031,dussehra,2031-10-24,drik dearborn

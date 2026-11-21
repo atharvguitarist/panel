@@ -1,0 +1,76 @@
+# Published festival dates the calculator must reproduce exactly.
+# The Action runs this check before writing festivals.txt; one mismatch
+# stops the run, so a library or rule change can never reach a panel unseen.
+# year,event,date,source   (New Delhi unless the source says otherwise)
+2025,holika_dahan,2025-03-13,drik holika-dahan page
+2026,holika_dahan,2026-03-03,drik holika-dahan page
+2027,holika_dahan,2027-03-21,drik holika-dahan page
+2028,holika_dahan,2028-03-10,drik holika-dahan page
+2020,holika_dahan,2020-03-09,dekhopanchang (past, observed)
+2021,holika_dahan,2021-03-28,dekhopanchang (past, observed)
+2022,holika_dahan,2022-03-17,dekhopanchang (past, observed)
+2023,holika_dahan,2023-03-07,dekhopanchang (past, observed)
+2024,holika_dahan,2024-03-24,dekhopanchang (past, observed)
+2025,rakhi,2025-08-09,drik rakhi page
+2026,rakhi,2026-08-28,drik rakhi page
+2027,rakhi,2027-08-17,drik rakhi page
+2028,rakhi,2028-08-05,drik rakhi page
+2025,ganesh_chaturthi,2025-08-27,drik ganesh pages
+2026,ganesh_chaturthi,2026-09-14,drik ganesh pages
+2027,ganesh_chaturthi,2027-09-04,drik ganesh pages
+2028,ganesh_chaturthi,2028-08-23,drik ganesh pages
+2029,ganesh_chaturthi,2029-09-11,drik ganesh pages
+2030,ganesh_chaturthi,2030-09-01,drik ganesh pages
+2031,ganesh_chaturthi,2031-09-20,drik ganesh pages
+2032,ganesh_chaturthi,2032-09-08,drik ganesh pages
+2033,ganesh_chaturthi,2033-08-28,drik ganesh pages
+2034,ganesh_chaturthi,2034-09-16,drik ganesh pages
+2035,ganesh_chaturthi,2035-09-05,drik ganesh pages
+2025,diwali,2025-10-20,drik lakshmi puja pages
+2026,diwali,2026-11-08,drik lakshmi puja pages
+2027,diwali,2027-10-29,drik lakshmi puja pages
+2028,diwali,2028-10-17,drik lakshmi puja pages
+2029,diwali,2029-11-05,drik lakshmi puja pages
+2030,diwali,2030-10-26,drik lakshmi puja pages
+2031,diwali,2031-11-14,drik lakshmi puja pages
+2032,diwali,2032-11-02,drik lakshmi puja pages
+2033,diwali,2033-10-22,drik lakshmi puja pages
+2034,diwali,2034-11-10,drik lakshmi puja pages
+2035,diwali,2035-10-30,drik lakshmi puja pages
+2022,janmashtami_smarta,2022-08-18,drik janmashtami (smarta) pages
+2023,janmashtami_smarta,2023-09-06,drik janmashtami (smarta) pages
+2024,janmashtami_smarta,2024-08-26,drik janmashtami (smarta) pages
+2025,janmashtami_smarta,2025-08-15,drik janmashtami (smarta) pages
+2026,janmashtami_smarta,2026-09-04,drik janmashtami (smarta) pages
+2027,janmashtami_smarta,2027-08-25,drik janmashtami (smarta) pages
+2028,janmashtami_smarta,2028-08-13,drik janmashtami (smarta) pages
+2029,janmashtami_smarta,2029-09-01,drik janmashtami (smarta) pages
+2030,janmashtami_smarta,2030-08-21,drik janmashtami (smarta) pages
+2031,janmashtami_smarta,2031-08-09,drik janmashtami (smarta) pages
+2032,janmashtami_smarta,2032-08-28,drik janmashtami (smarta) pages
+2033,janmashtami_smarta,2033-08-17,drik janmashtami (smarta) pages
+2034,janmashtami_smarta,2034-09-05,drik janmashtami (smarta) pages
+2035,janmashtami_smarta,2035-08-26,drik janmashtami (smarta) pages
+2022,janmashtami_sunrise,2022-08-19,drik iskcon janmashtami page
+2023,janmashtami_sunrise,2023-09-07,drik iskcon janmashtami page
+2024,janmashtami_sunrise,2024-08-26,drik iskcon janmashtami page
+2025,janmashtami_sunrise,2025-08-16,drik iskcon janmashtami page
+2026,janmashtami_sunrise,2026-09-04,drik iskcon janmashtami page
+2027,janmashtami_sunrise,2027-08-25,drik iskcon janmashtami page
+2028,janmashtami_sunrise,2028-08-13,drik iskcon janmashtami page
+2029,janmashtami_sunrise,2029-09-01,drik iskcon janmashtami page
+2030,janmashtami_sunrise,2030-08-21,drik iskcon janmashtami page
+2031,janmashtami_sunrise,2031-08-10,drik iskcon janmashtami page
+2032,janmashtami_sunrise,2032-08-28,drik iskcon janmashtami page
+2025,dussehra,2025-10-02,drik dussehra page
+2026,dussehra,2026-10-20,drik dussehra page
+2027,dussehra,2027-10-09,drik dussehra page
+2028,dussehra,2028-09-27,drik dussehra page
+2026,ghatasthapana,2026-10-11,news (ghatasthapana Sun Oct 11)
+2020,bhai_dooj,2020-11-16,dekhopanchang
+2021,bhai_dooj,2021-11-06,dekhopanchang
+2024,bhai_dooj,2024-11-03,dekhopanchang
+2025,bhai_dooj,2025-10-23,dekhopanchang
+2030,bhai_dooj,2030-10-28,dekhopanchang
+2029,holika_dahan,2029-02-28,drik holi 2029 page
+2029,holi,2029-03-01,drik holi 2029 page

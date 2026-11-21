@@ -1,0 +1,5 @@
+# Hand corrections for the festival calendar. Same format as festivals.txt:
+#   key,first day,last day        e.g.  diwali,2031-11-14,2031-11-16
+# A line here replaces the computed entry of the same festival within 20
+# days of it, and survives every future run. Committing this file
+# republishes the calendar within a minute. Empty = trust the calculation.

@@ -1,0 +1,66 @@
+# Festival calendar for Panel -- written by tools/festival_calendar.py.
+# Lunisolar dates for India (New Delhi sunrise), 2026-2035.
+# Fixed-date days (New Year, Christmas, Republic Day...) live in the firmware.
+# To correct a date, add a line to config/festivals_overrides.txt instead of
+# editing this file: the next run would overwrite an edit here.
+# key,first day,last day
+holi,2026-03-04,2026-03-04
+rakhi,2026-08-28,2026-08-28
+janmashtami,2026-09-04,2026-09-04
+ganesh_chaturthi,2026-09-14,2026-09-14
+navratri,2026-10-11,2026-10-19
+diwali,2026-11-08,2026-11-11
+holi,2027-03-22,2027-03-22
+rakhi,2027-08-17,2027-08-17
+janmashtami,2027-08-25,2027-08-25
+ganesh_chaturthi,2027-09-04,2027-09-04
+navratri,2027-09-30,2027-10-08
+diwali,2027-10-29,2027-10-31
+holi,2028-03-11,2028-03-11
+rakhi,2028-08-05,2028-08-05
+janmashtami,2028-08-13,2028-08-13
+ganesh_chaturthi,2028-08-23,2028-08-23
+navratri,2028-09-19,2028-09-26
+diwali,2028-10-17,2028-10-19
+holi,2029-03-01,2029-03-01
+rakhi,2029-08-23,2029-08-23
+janmashtami,2029-09-01,2029-09-01
+ganesh_chaturthi,2029-09-11,2029-09-11
+navratri,2029-10-08,2029-10-15
+diwali,2029-11-05,2029-11-07
+holi,2030-03-20,2030-03-20
+rakhi,2030-08-13,2030-08-13
+janmashtami,2030-08-21,2030-08-21
+ganesh_chaturthi,2030-09-01,2030-09-01
+navratri,2030-09-28,2030-10-05
+diwali,2030-10-26,2030-10-28
+holi,2031-03-09,2031-03-09
+rakhi,2031-08-02,2031-08-02
+janmashtami,2031-08-09,2031-08-10
+ganesh_chaturthi,2031-09-20,2031-09-20
+navratri,2031-10-17,2031-10-24
+diwali,2031-11-14,2031-11-16
+holi,2032-03-27,2032-03-27
+rakhi,2032-08-20,2032-08-20
+janmashtami,2032-08-28,2032-08-28
+ganesh_chaturthi,2032-09-08,2032-09-08
+navratri,2032-10-05,2032-10-13
+diwali,2032-11-02,2032-11-05
+holi,2033-03-16,2033-03-16
+rakhi,2033-08-10,2033-08-10
+janmashtami,2033-08-17,2033-08-17
+ganesh_chaturthi,2033-08-28,2033-08-28
+navratri,2033-09-24,2033-10-02
+diwali,2033-10-22,2033-10-25
+holi,2034-03-05,2034-03-05
+rakhi,2034-08-29,2034-08-29
+janmashtami,2034-09-05,2034-09-05
+ganesh_chaturthi,2034-09-16,2034-09-16
+navratri,2034-10-13,2034-10-21
+diwali,2034-11-10,2034-11-13
+holi,2035-03-24,2035-03-24
+rakhi,2035-08-18,2035-08-18
+janmashtami,2035-08-26,2035-08-26
+ganesh_chaturthi,2035-09-05,2035-09-05
+navratri,2035-10-02,2035-10-10
+diwali,2035-10-30,2035-11-02

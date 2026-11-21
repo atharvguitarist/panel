@@ -246,7 +246,7 @@ Commit a file there and `publish.yml` lists every file with its checksum in `fir
 
 Only `bg`, `festival`, `icons`, `ui`, `weather_day` and `weather_night` are accepted; the publisher refuses anything else, and panels never write outside those folders — `/config`, logs and firmware are out of reach. Deleting a file from the repository leaves the card copy in place. Firmware itself never goes through the card: it installs over the air from the phone page.
 
-**Festival dates** — put `config/festivals.txt` in the repository (`key,YYYY-MM-DD,YYYY-MM-DD`, one festival per line). `publish.yml` validates it and panels fetch it when its stamp changes. Navratri and other lunisolar dates come from the panchang, so the file is the single source of truth.
+**Festival dates** — computed, not typed. On 1 January and 1 July, `festivals.yml` works out the next ten years of Diwali, Holi, Navratri, Janmashtami, Ganesh Chaturthi and Rakhi from the positions of the Sun and Moon (the panchang rules, New Delhi sunrise), and writes `config/festivals.txt`. Before anything is published it must reproduce 90 dates published by Drik Panchang exactly, land every festival in its season, and leave every date in the next twelve months where it was. Panels fetch the file only when its stamp changes — about once a year. To correct a date by hand, add a line to `config/festivals_overrides.txt`; it wins over the calculation and survives every run.
 
 <details>
 <summary><b>Repository layout</b></summary>
@@ -266,9 +266,13 @@ sketch/versions.env      Library versions the build uses
 
 firmware/                latest.bin · manifest.json · symbols.txt.gz
                          (written by the build — never edit by hand)
-tools/                   publish.py · validate_festivals.py
-.github/workflows/       build.yml (compile + publish)
-                         publish.yml (festival dates, or a prebuilt .bin)
+config/                  festivals.txt (written by the calendar run)
+                         festivals_overrides.txt (hand corrections)
+tools/                   publish.py · validate_festivals.py · lint_sketch.py
+                         festival_calendar.py · festival_reference*.txt
+.github/workflows/       build.yml (lint + compile + publish)
+                         publish.yml (festival file, card art, or a prebuilt .bin)
+                         festivals.yml (festival calendar, twice a year)
 ```
 
 </details>
