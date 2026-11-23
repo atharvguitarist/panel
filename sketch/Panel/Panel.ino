@@ -179,7 +179,7 @@ const char* PHONE_UI_BASE_URL = "https://atharvguitarist.github.io/panel/";
 // straight out of the uploaded .bin -- change ONLY the number. FW_VERSION
 // points past the tag, so every existing use is unchanged, and because it is
 // used everywhere the linker can never strip the tag from the binary.
-const char  FW_VERSION_TAG[] = "PANELFW:5.9.10";
+const char  FW_VERSION_TAG[] = "PANELFW:5.9.11";
 const char* FW_VERSION = FW_VERSION_TAG + 8;
 const char* FW_MANIFEST_PATH = "firmware/manifest.json";
 const char* FW_BINARY_PATH   = "firmware/latest.bin";
@@ -792,6 +792,7 @@ volatile int      statPushLastFailCode   = 0;   // HTTP code / -ve = network
 static QueueHandle_t     pushQueue = nullptr;
 static SemaphoreHandle_t tlsGate   = nullptr;   // outbound TLS: one at a time
 static char              pushFailPending[96] = ""; // worker -> loop(): log line
+static volatile int      pushLastTlsErr      = 0;  // mbedTLS code behind a -1 (0 = none)
 volatile uint8_t festivalConfigSynced = 0; // 1 = SD file replaced from GitHub, 2 = already identical
 char festivalConfigVer[24] = "";            // stamp of the repo file last applied (NVS "festVer")
 // Festival file body fetched by the worker, validated and written by loop()
@@ -2321,6 +2322,24 @@ void applyClockPillPlacement() {
   lv_obj_set_pos(clockPill, 657, atTop ? 24 : 417);
 }
 
+// The sunrise/sunset pair comes from the last weather fetch, which can be
+// days old (link down, or restored from flash after a reboot). Compared
+// as-is, a stale pair reads "after sunset" for the whole day. So slide the
+// pair forward by whole days until `now` sits inside its cycle: sr <= now <
+// sr + 24 h. Sun times move about a minute a day, so a week-old pair is
+// still within minutes; beyond a week the fixed-hours fallback takes over.
+static bool sunCycle(time_t now, time_t &sr, time_t &ss) {
+  if (!weatherHasSunTimes || sunriseEpoch <= 0 || sunsetEpoch <= sunriseEpoch ||
+      sunsetEpoch - sunriseEpoch >= 86400) return false;
+  long d = (long)(now - sunriseEpoch);
+  long days = d / 86400;
+  if (d < 0 && d % 86400 != 0) days--;              // floor, not truncate
+  if (days > 7 || days < -2) return false;
+  sr = sunriseEpoch + (time_t)days * 86400;
+  ss = sunsetEpoch  + (time_t)days * 86400;
+  return true;
+}
+
 bool isNightNow() {
   time_t now = time(nullptr);
 
@@ -2329,9 +2348,10 @@ bool isNightNow() {
     return false;
   }
 
-  // Best logic: use OpenWeather sunrise/sunset.
-  if (weatherHasSunTimes && sunriseEpoch > 0 && sunsetEpoch > 0) {
-    return (now < sunriseEpoch || now >= sunsetEpoch);
+  // Best logic: use the weather service's sunrise/sunset.
+  time_t sr, ss;
+  if (sunCycle(now, sr, ss)) {
+    return now >= ss;                               // now >= sr by construction
   }
 
   // Fallback if weather is unavailable.
@@ -2451,16 +2471,13 @@ void scheduleNextThemeEvent() {
     return;
   }
 
-  if (weatherHasSunTimes && sunriseEpoch > 0 && sunsetEpoch > 0) {
-    if (now < sunriseEpoch) {
-      nextThemeEventEpoch = sunriseEpoch;
-    } else if (now < sunsetEpoch) {
-      nextThemeEventEpoch = sunsetEpoch;
-    } else {
-      // After today's sunset. Wait for next weather update to refresh tomorrow's sunrise.
-      // Safe fallback: check after 1 hour.
-      nextThemeEventEpoch = now + 3600;
-    }
+  time_t sr, ss;
+  if (sunCycle(now, sr, ss)) {
+    // Next change: today's sunset, or after it tomorrow's sunrise.
+    nextThemeEventEpoch = (now < ss) ? ss : sr + 86400;
+    // The wallpaper on screen must match the sky right now; if it does not
+    // (stale data just refreshed, or a missed event), look at it next tick.
+    if (initialThemeSet && (now >= ss) != darkThemeActive) nextThemeEventEpoch = now;
   } else {
     // Fallback schedule if weather sunrise/sunset unavailable.
     struct tm t;
@@ -3975,9 +3992,12 @@ static uint32_t deepen(uint32_t c) {
 }
 
 static void toastAnimCb(void *obj, int32_t v) {
-  // v: 0 = hidden (transparent, 10 px up) .. 256 = shown
-  lv_obj_set_style_opa((lv_obj_t *)obj, (lv_opa_t)(v > 255 ? 255 : v), 0);
-  lv_obj_set_style_translate_y((lv_obj_t *)obj, (lv_coord_t)(-10 + (10 * v) / 256), 0);
+  // v: 0 = parked above the edge .. 256 = in place. A pure slide: no object
+  // opacity, which makes LVGL render the pill through an offscreen layer
+  // (24 KB of heap, an extra blend per frame, and no drawing at all if that
+  // buffer cannot be had -- the pill then seems to just appear). Moving an
+  // opaque pill is the cheapest animation there is.
+  lv_obj_set_style_translate_y((lv_obj_t *)obj, (lv_coord_t)(-48 + (48 * v) / 256), 0);
 }
 static void toastHiddenCb(lv_anim_t *a) { (void)a; if (toastBox) lv_obj_add_flag(toastBox, LV_OBJ_FLAG_HIDDEN); }
 static void toastAnimate(bool in) {
@@ -3987,7 +4007,7 @@ static void toastAnimate(bool in) {
   lv_anim_set_var(&a, toastBox);
   lv_anim_set_exec_cb(&a, toastAnimCb);
   lv_anim_set_values(&a, in ? 0 : 256, in ? 256 : 0);
-  lv_anim_set_time(&a, in ? 260 : 200);
+  lv_anim_set_time(&a, in ? 320 : 220);
   lv_anim_set_path_cb(&a, in ? lv_anim_path_ease_out : lv_anim_path_ease_in);
   if (!in) lv_anim_set_ready_cb(&a, toastHiddenCb);
   lv_anim_start(&a);
@@ -5113,6 +5133,9 @@ int doNtfyPublish(const char *suffix, const char *title, const char *message, co
     http.addHeader("Click", page);
   }
   int httpCode = http.POST((uint8_t *)message, strlen(message));
+  // -1 only says "could not connect"; the TLS layer knows why (handshake,
+  // out of memory, reset). Keep that code for the log line.
+  if (httpCode < 0) { char why[8]; pushLastTlsErr = client.lastError(why, sizeof(why)); }
   http.end();
   return httpCode;
 }
@@ -5195,8 +5218,9 @@ static void pushWorkerTask(void *param) {
       if (statPushFail < 65535) statPushFail++;
       statPushLastFailCode = code;
       if (pushFailPending[0] == '\0') {
-        snprintf(pushFailPending, sizeof(pushFailPending), "Push failed (%d) heap %uK blk %uK: %.40s",
-                 code, (unsigned)(ESP.getFreeHeap() / 1024), (unsigned)(ESP.getMaxAllocHeap() / 1024),
+        snprintf(pushFailPending, sizeof(pushFailPending), "Push failed (%d/%d) heap %uK blk %uK: %.36s",
+                 code, code < 0 ? (int)pushLastTlsErr : 0,
+                 (unsigned)(ESP.getFreeHeap() / 1024), (unsigned)(ESP.getMaxAllocHeap() / 1024),
                  p->message);
       }
     }
@@ -10567,9 +10591,10 @@ bool manualOnShouldExpire() {
     time_t now = time(nullptr);
     time_t nextSunrise = sunriseEpoch;
 
-    // If today's sunrise already passed, use tomorrow's approximate sunrise.
+    // If that sunrise already passed (however many days ago the weather was
+    // last fetched), use the next one, approximated by whole days.
     if (nextSunrise <= now) {
-      nextSunrise += 86400;
+      nextSunrise += ((now - nextSunrise) / 86400 + 1) * 86400;
     }
 
     return now >= nextSunrise;
