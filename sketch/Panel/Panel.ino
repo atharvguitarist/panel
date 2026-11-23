@@ -179,7 +179,7 @@ const char* PHONE_UI_BASE_URL = "https://atharvguitarist.github.io/panel/";
 // straight out of the uploaded .bin -- change ONLY the number. FW_VERSION
 // points past the tag, so every existing use is unchanged, and because it is
 // used everywhere the linker can never strip the tag from the binary.
-const char  FW_VERSION_TAG[] = "PANELFW:5.9.11";
+const char  FW_VERSION_TAG[] = "PANELFW:5.9.12";
 const char* FW_VERSION = FW_VERSION_TAG + 8;
 const char* FW_MANIFEST_PATH = "firmware/manifest.json";
 const char* FW_BINARY_PATH   = "firmware/latest.bin";
@@ -5993,6 +5993,11 @@ static size_t httpsRangedDownload(const char *url, uint8_t *buf, size_t size, vo
         total += r; got += r;
         if (pct) *pct = (uint8_t)((total * 100ULL) / size);
         lastDataAt = millis();
+        // On a fast link data is always waiting, so this loop never blocks
+        // and the idle task on this core never runs: after ~5 s the task
+        // watchdog resets the panel. One tick per chunk (up to 16 KB) hands
+        // the core back; the cap is still far above any Wi-Fi speed.
+        vTaskDelay(1);
       } else {
         if (!http->connected() && stream->available() == 0) break;
         if (millis() - lastDataAt > 4000UL) break;      // stalled: drop and ask again
